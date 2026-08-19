@@ -1,10 +1,7 @@
-import os
-import sys
 import serial
 import cv2
 import numpy as np
 import time 
-import threading
 from collections import defaultdict
 from pyzbar.pyzbar import decode
 # 启用优化（默认通常是True，但建议显式设置）
@@ -40,15 +37,6 @@ ser = serial.Serial(
     timeout=0.1
 )
 
-def restart_program():
-    """
-    退出当前程序并在20秒后重新启动
-    """
-    print("接收到数字指令0，程序将在20秒后重新启动...")
-    time.sleep(20)
-    python = sys.executable
-    os.execl(python, python, *sys.argv)
-
 def send_data(data):
     """
     发送数据到 STM32，数据格式为固定的8字节。
@@ -59,26 +47,6 @@ def send_data(data):
     data_packet = bytes([0xFF] + array[:9] + [0xFE]) 
     ser.write(data_packet)
     print(f"发送: {data_packet}") 
-
-def receive_data():
-    """非阻塞式接收数据"""
-    if ser.in_waiting > 0:
-        data = ser.readline().decode('utf-8').strip()
-        return data
-    return None
-
-def wait_and_receive_data():
-    """等待1秒钟接收7位数据"""
-    global A
-    start_time = time.time()
-    while time.time() - start_time < 1:
-        data = receive_data()
-        if data and len(data) == 7:
-            A = list(data)
-            print(f"接收到的数据: {data}")
-            print(f"已存储到数组A: {A}")
-            return
-    print("等待1秒钟未接收到数据，重新开始...")
 
 # 获取颜色名称（共享函数）
 def get_color_name(bgr_val):
@@ -1766,127 +1734,5 @@ def run_maduoyuanxin2_centered():  # 初赛放物块的时候，色环第二次�
             
         time.sleep(0.05)
 
-class SerialInterruptHandler:
-    def __init__(self):
-        self.running = True
-        self.last_data_time = time.time()
-    def handle_serial_data(self, data):
-        """处理接收到的串口数据"""
-        global cap, cap2, C_1, C_2, C_1_loop2, C_2_loop2
-        global INDEX, INDEX1, INDEX2, INDEX_loop2, INDEX1_loop2, INDEX2_loop2
-        print(f"接收到: {data}")
-        self.last_data_time = time.time()
-        if "1" in data:
-            print(f"检测到任务1: 执行二维码检测")
-            run_erweima()    
-            cap = cv2.VideoCapture("/dev/video_shang0", cv2.CAP_V4L2)
-        elif "2" in data:
-            print(f"检测到任务2: 执行物块检测")
-            C_1 = run_wukuaiyuanxin_1()
-        elif "a" in data:
-            print(f"检测到任务2: 执行物块检测")
-            cap = cv2.VideoCapture("/dev/video_shang0", cv2.CAP_V4L2)
-            C_1_loop2 = run_wukuaiyuanxin_1()
-        elif "3" in data:
-            print(f"检测到任务2: 执行第一圈的转盘物块检测")
-            LOOP1()
-            if cap and cap.isOpened():
-                cap.release()
-        elif "4" in data:
-            print(f"检测到任务2: 执行第二圈的转盘物块检测")
-            LOOP2()
-            if cap and cap.isOpened():
-                cap.release()
-        elif "5" in data:
-            print(f"first loop已经抓完第一个物块，识别第二个物块是否稳定")
-            if INDEX1 == 1:
-                run_wukuaiyuanxin_xuanzequyu(INDEX1, A[1])
-            else:
-                run_wukuaiyuanxin_xuanzequyu(0, A[1])
-        elif "6" in data:
-            print(f"first_loop已经抓完第二个物块，识别第三个物块是否稳定")
-            if INDEX2 == 1:
-                run_wukuaiyuanxin_xuanzequyu(INDEX2, A[2])
-            else:
-                run_wukuaiyuanxin_xuanzequyu(0, A[2])
-        elif "b" in data:
-            print(f"second_loop已经抓完第一个物块，识别第二个物块是否稳定")
-            if INDEX1_loop2 == 1:
-                run_wukuaiyuanxin_xuanzequyu(INDEX1_loop2, A[5])
-            else:
-                run_wukuaiyuanxin_xuanzequyu(0, A[5])
-        elif "c" in data:
-            print(f"second_loop已经抓完第二个物块，识别第三个物块是否稳定")
-            if INDEX2_loop2 == 1:
-                run_wukuaiyuanxin_xuanzequyu(INDEX2_loop2, A[6])
-            else:
-                run_wukuaiyuanxin_xuanzequyu(0, A[6])  
-        elif "7" in data:
-            cap2 = cv2.VideoCapture("/dev/video_shang0", cv2.CAP_V4L2)
-            print(f"进行色环检测的第一次定标")
-            run_sehuanyuanxin2()
-        elif "d" in data:
-            print(f"进行色环检测的直线纠偏")
-            #detect_boundary_line()
-            send_data("000000000")
-        elif "8" in data:
-            print(f"进行色环检测的精细定标")
-            run_sehuanyuanxin2_centered()
-            if cap2 and cap2.isOpened():
-                cap2.release()
-        elif "9" in data:
-            cap2 = cv2.VideoCapture("/dev/video_shang0", cv2.CAP_V4L2)
-            print(f"进行码垛检测的第一次定标")
-            run_maduoyuanxin2()
-            if cap2 and cap2.isOpened():
-                cap2.release()                    
-        elif "0" in data:
-            print(f"进行码垛检测的精细定标")
-            run_maduoyuanxin2()
-        elif "r" in data:
-            ser.close()
-            restart_program()
-            print(f"串口 {ser.port} 已打开")
-            send_data("987654321")
-            print("已发送987654321")
-        elif "end" in data:
-            print(f"任务序列完成。")
-            self.running = False
-    def run(self):
-        """主运行循环"""
-        if not ser.is_open:
-            ser.open()
-        print(f"串口 {ser.port} 已打开")
-        send_data("987654321")
-        print("已发送987654321")
-        
-        try:
-            while self.running:
-                # 使用中断机制检查串口数据
-                data = receive_data()
-                if data:
-                    self.handle_serial_data(data)
-                else:
-                    # 没有数据时短暂休眠，减少CPU占用
-                    time.sleep(0.01)
-                    
-                # 检查长时间未收到数据的情况
-                if time.time() - self.last_data_time > 300:  # 60秒无数据
-                    print("警告: 300秒未收到任何数据，检查连接...")
-                    self.last_data_time = time.time()
-                    
-        except KeyboardInterrupt:
-            print("程序被用户终止")
-        finally:
-            ser.close()
-            print(f"串口 {ser.port} 已关闭")
-            # 释放所有摄像头资源
-            if cap and cap.isOpened():
-                cap.release()
-            if cap2 and cap2.isOpened():
-                cap2.release()
-            cv2.destroyAllWindows()
-
 if __name__ == "__main__":
-    handler = SerialInterruptHandler()
-    handler.run()
+    print("旧文本指令入口已移除，请使用 src.py 运行当前流程。")

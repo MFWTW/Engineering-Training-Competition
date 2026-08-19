@@ -1,58 +1,79 @@
 import cv2
 import os
 import numpy as np
-from collections import defaultdict
+from pathlib import Path
 
-# ==================== 颜色阈值配置 ====================
-color_thresholds = {
-    'red': {'lower1': [0, 43, 46], 'upper1': [10, 255, 255],
-                'lower2': [156, 43, 46], 'upper2': [180, 255, 255]},
-    'green':      {'lower':  [69, 127, 54],  'upper':  [92, 255, 158]},
-    'blue':       {'lower':  [110, 138, 87], 'upper':  [122, 255, 155]},
-    'light_blue': {'lower':  [94, 134, 162], 'upper':  [123, 218, 255]},
-    'black':      {'lower':  [0, 0, 0],      'upper':  [180, 255, 33]},
-    'yellow':     {'lower':  [22, 78, 30],   'upper':  [42, 255, 255]},
-}
+import yaml
 
-# 颜色代码 -> 索引映射（用于 max 比较）
-COLOR_KEYS = ['red', 'green', 'blue', 'light_blue', 'black', 'yellow']
-COLOR_CODE_MAP = {'red': '1', 'green': '2', 'blue': '3',
-                  'light_blue': '4', 'black': '5', 'yellow': '6'}
+
+CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+
+
+def load_config(path=CONFIG_PATH):
+    """从 YAML 文件加载颜色检测配置"""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"找不到颜色检测配置文件: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def save_config(config=None, path=CONFIG_PATH):
+    """把配置写回 YAML 文件（供 hsv_tuner 等调试工具保存调参结果）"""
+    if config is None:
+        config = CONFIG
+    with Path(path).open("w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, allow_unicode=True,
+                       sort_keys=False, default_flow_style=False)
+
+
+CONFIG = load_config()
+
+# ==================== 颜色阈值配置（由 config.yaml 加载） ====================
+_COLORS_CFG = CONFIG["colors"]
+COLOR_KEYS = list(_COLORS_CFG["order"])
+
+color_thresholds = {}
+MORPH_PARAMS = {}
+COLOR_CODE_MAP = {}
+for _name in COLOR_KEYS:
+    _cfg = _COLORS_CFG[_name]
+    color_thresholds[_name] = {
+        k: list(v) for k, v in _cfg.items()
+        if k in ('lower', 'upper', 'lower1', 'upper1', 'lower2', 'upper2')
+    }
+    MORPH_PARAMS[_name] = (int(_cfg['morph']['erode']),
+                           int(_cfg['morph']['dilate']))
+    COLOR_CODE_MAP[_name] = str(_cfg['code'])
 
 # 反向映射：颜色代码 → 颜色名（用于根据 QR 任务只检测目标颜色）
-CODE_TO_KEY = {'1': 'red', '2': 'green', '3': 'blue',
-               '4': 'light_blue', '5': 'black', '6': 'yellow'}
+CODE_TO_KEY = {code: name for name, code in COLOR_CODE_MAP.items()}
 
-# 每种颜色的形态学参数：(erode_iter, dilate_iter)
-MORPH_PARAMS = {
-    'red':        (1, 2),
-    'green':      (2, 6),
-    'blue':       (1, 3),
-    'light_blue': (1, 3),
-    'black':      (1, 3),
-    'yellow':     (1, 3),
-}
+_DET_CFG = CONFIG["detection"]
 
 
 class BlockDetector:
     """物块颜色检测器 —— 封装所有检测状态，支持 reset 重置"""
 
     def __init__(self, detection_area=None, circle_params=None,
-                 stability_settings=None, timeout_ms=100, kernel_size=3):
-        # 检测区域 [x, y, w, h]，None 表示全图
-        self.detection_area = detection_area
+                 stability_settings=None, timeout_ms=None, kernel_size=None):
+        # 默认值统一取自 config.yaml；显式传入的参数优先
+        if detection_area is None:
+            detection_area = _DET_CFG.get("detection_area")
+        self.detection_area = detection_area  # [x, y, w, h]，None 表示全图
         # 霍夫圆参数
-        self.circle_params = circle_params or {
-            'min_radius': 50, 'max_radius': 450, 'param1': 25, 'param2': 25
-        }
+        if circle_params is None:
+            circle_params = dict(_DET_CFG.get("circle", {}))
+        self.circle_params = circle_params
         # 稳定性设置
-        self.stability_settings = stability_settings or {
-            'threshold': 30,
-            'max_pixel_move': 10,
-            'color_stable_threshold': 15,
-            'color_confidence': 0.7
-        }
+        if stability_settings is None:
+            stability_settings = dict(_DET_CFG.get("stability", {}))
+        self.stability_settings = stability_settings
+        if timeout_ms is None:
+            timeout_ms = _DET_CFG.get("timeout_ms", 100)
         self.timeout_settings = {'timeout_ms': timeout_ms}
+        if kernel_size is None:
+            kernel_size = _DET_CFG.get("kernel_size", 3)
         self.kernel = np.ones((kernel_size, kernel_size), np.uint8)
 
         # ---- 运行状态 ----
@@ -61,13 +82,11 @@ class BlockDetector:
     def reset(self):
         """重置所有检测状态（新一轮检测前调用）"""
         self.stable_count = 0
-        self.first_center = None
-        self.last_detection_time = None
-        self.color_history = []
+        self.color_stable_count = 0
+        self.last_center = None
+        self.last_color = None
         self.final_color = None
         self.last_radius = 0
-        self.last_color_code = None
-        self.detection_sent = False  # 防止重复发送
 
     def _build_color_masks(self, hsv_img, target_key=None):
         """构建颜色掩膜。target_key 不为 None 时只构建目标颜色掩膜"""
@@ -94,7 +113,8 @@ class BlockDetector:
     def detect(self, frame, target_code=None):
         """
         1. 全图做灰度和高斯模糊
-        2. HSV 转换
+        2. （若配置了 detection_area）只在该 ROI 内做 HSV 与轮廓筛选，
+           排除画面边缘/自身车轮等误检区域；输出坐标映射回全图
         3. 找出目标颜色 → 建掩膜 → 轮廓筛选 → 真正的目标区域
         4. 对目标区域构建 ROI，画圆
         5. 输出 (formatted_data, center, color_code)
@@ -104,16 +124,36 @@ class BlockDetector:
         """
         h, w_full = frame.shape[:2]
 
-        # ── 步骤 1：全图灰度 + 高斯模糊 ──
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 2, 2)
+        # ── 步骤 0：按配置裁剪检测区域（ROI 内检测，坐标后面映射回全图） ──
+        roi = self.detection_area
+        if roi is not None:
+            rx, ry, rw, rh = (int(v) for v in roi)
+            rx = max(0, min(rx, w_full - 1))
+            ry = max(0, min(ry, h - 1))
+            rw = max(0, min(rw, w_full - rx))
+            rh = max(0, min(rh, h - ry))
+            if rw <= 0 or rh <= 0:
+                return None, None, None
+            frame = frame[ry:ry + rh, rx:rx + rw]
+        else:
+            rx = ry = 0
+            rw = w_full
+            rh = h
 
-        # ── 步骤 2：全图 HSV 转换 ──
+        # ── 步骤 1：ROI 内灰度 + 高斯模糊 ──
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur_cfg = _DET_CFG.get("blur", {})
+        blur_k = int(blur_cfg.get("kernel", 5))
+        gray = cv2.GaussianBlur(gray, (blur_k, blur_k),
+                                float(blur_cfg.get("sigma_x", 2)),
+                                float(blur_cfg.get("sigma_y", 2)))
+
+        # ── 步骤 2：ROI 内 HSV 转换 ──
         hsv_img = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         # ── 步骤 3：找出目标颜色 → 掩膜 → 轮廓 → 真正目标区域 ──
 
-        # 3a) 构建颜色掩膜（全图范围，不先用 ROI 裁剪）
+        # 3a) 构建颜色掩膜（仅 ROI 范围）
         if target_code is not None and target_code in CODE_TO_KEY:
             target_key = CODE_TO_KEY[target_code]
             color_masks = self._build_color_masks(hsv_img, target_key=target_key)
@@ -138,7 +178,8 @@ class BlockDetector:
 
         # 面积门限
         min_r = max(1, int(self.circle_params.get('min_radius', 30)))
-        min_area_thresh = np.pi * (min_r ** 2) * 0.2
+        min_area_factor = float(_DET_CFG.get("circle", {}).get("min_area_factor", 0.2))
+        min_area_thresh = np.pi * (min_r ** 2) * min_area_factor
 
         best_candidate = None
         best_area = 0
@@ -162,18 +203,31 @@ class BlockDetector:
             return None, None, None
 
         cx, cy, radius, cnt = best_candidate
+        # ROI 内坐标 → 全图坐标
+        cx_full = cx + rx
+        cy_full = cy + ry
 
-        # ── 步骤 4：对目标区域（ROI）画圆、判定颜色 ──
+        # 圆必须完整落在 ROI 内：被 ROI 边缘切掉的残缺圆不能算有效目标，
+        # 否则切边后的圆心会偏向 ROI 边缘，导致“出了区域还被抓取”。
+        if roi is not None:
+            if not (rx + radius <= cx_full <= rx + rw - radius
+                    and ry + radius <= cy_full <= ry + rh - radius):
+                return None, None, None
 
-        # 4a) 在全图尺寸上构建圆形掩膜
+        # ── 步骤 4：对目标区域画圆、判定颜色 ──
+
+        # 4a) 在全图尺寸上构建圆形掩膜（用映射回全图的中心）
         roi_mask = np.zeros((h, w_full), dtype=np.uint8)
-        cv2.circle(roi_mask, (int(cx), int(cy)), radius, 255, -1)
+        cv2.circle(roi_mask, (int(cx_full), int(cy_full)), radius, 255, -1)
 
         # 4b) 在该圆内判定主颜色
         areas = {}
         for color_key in color_masks:
             areas[color_key] = cv2.countNonZero(
-                cv2.bitwise_and(color_masks[color_key], roi_mask)
+                cv2.bitwise_and(
+                    color_masks[color_key],
+                    roi_mask[ry:ry + rh, rx:rx + rw],
+                )
             )
 
         if not areas:
@@ -191,9 +245,7 @@ class BlockDetector:
 
         # ── 步骤 5：输出 ──
         self.last_radius = radius
-        self.last_color_code = color_code
-
-        center = (int(cx), int(cy))
+        center = (int(cx_full), int(cy_full))
         formatted_data = f"{center[0]:04}{center[1]:04}{color_code}"
         return formatted_data, center, color_code
 
@@ -201,39 +253,64 @@ class BlockDetector:
         """
         更新稳定性状态。应在 detect() 返回有效数据后调用。
 
-        Returns:
-            is_stable (bool): 是否达到稳定条件
-        """
-        self.color_history.append(current_color)
+        stable_count        —— 物块位置稳定计数：连续多少帧圆心位移 < max_pixel_move
+        color_stable_count  —— 颜色稳定计数：连续多少帧识别为同一颜色
+        两者互相独立，各自达到阈值后才算整体稳定。
 
-        if self.first_center is None:
-            self.first_center = current_center
+        Returns:
+            is_stable (bool): 位置与颜色两个稳定条件是否同时满足
+            （src.py 会单独读取 stable_count / color_stable_count
+             做两段式控制：颜色稳定先跟踪，位置稳定后抓取）
+        """
+        # ── 物块位置稳定计数：连续 N 帧圆心位移 < max_pixel_move ──
+        if self.last_center is None:
+            # 第一次检测到目标
+            self.last_center = current_center
             self.stable_count = 1
         else:
+            # 与上一帧位置比较，而不是与第一帧比较：
+            # 目标持续移动时，与第一帧的偏差必然越来越大，
+            # 旧逻辑会反复重置稳定计数，导致跟踪指令一直发不出去（表现很卡）。
             distance = np.sqrt(
-                (current_center[0] - self.first_center[0]) ** 2 +
-                (current_center[1] - self.first_center[1]) ** 2
+                (current_center[0] - self.last_center[0]) ** 2 +
+                (current_center[1] - self.last_center[1]) ** 2
             )
             if distance < self.stability_settings['max_pixel_move']:
                 self.stable_count += 1
             else:
+                # 位置跳变（目标切换/误检）：重置计数，
+                # 同时保留当前帧作为新一轮的起点，加快重新锁定
                 self.stable_count = 1
-                self.first_center = current_center
-                self.color_history = []
 
-        # 颜色置信度检查
-        if len(self.color_history) >= self.stability_settings['color_stable_threshold']:
-            counter = defaultdict(int)
-            for c in self.color_history:
-                counter[c] += 1
-            most_common = max(counter.items(), key=lambda x: x[1])[0]
-            confidence = counter[most_common] / len(self.color_history)
-            if confidence >= self.stability_settings['color_confidence']:
-                self.final_color = most_common
-                print(f"颜色识别稳定: {most_common} (置信度: {confidence:.2f})")
+        self.last_center = current_center
+
+        # ── 颜色稳定计数：连续同色才累计，与位置计数互相独立 ──
+        if self.last_color is None or current_color != self.last_color:
+            # 第一次检测到颜色 / 颜色跳变：重新开始计数，未确认的颜色作废
+            self.color_stable_count = 1
+            self.final_color = None
+        else:
+            self.color_stable_count += 1
+        self.last_color = current_color
+
+        if (self.color_stable_count >= self.stability_settings['color_stable_threshold']
+                and self.final_color != current_color):
+            self.final_color = current_color
+            print(f"颜色识别稳定: {current_color} "
+                  f"(连续 {self.color_stable_count} 帧)")
 
         return (self.stable_count >= self.stability_settings['threshold']
-                and self.final_color is not None)
+                and self.color_stable_count >= self.stability_settings['color_stable_threshold'])
+
+    def on_miss(self):
+        """检测缺失/颜色未命中时调用：颜色计数清零，未确认的颜色作废。
+
+        位置计数 stable_count 不受影响（保持原有“未检测到时冻结”的语义）；
+        目标重新出现后，颜色计数从 0 重新累计。
+        """
+        self.color_stable_count = 0
+        self.last_color = None
+        self.final_color = None
 
     def get_result_data(self, center):
         """稳定后获取格式化发送数据 (9字符: XXXXYYYYC)"""
@@ -250,12 +327,10 @@ stability_settings  = _default_detector.stability_settings
 timeout_settings    = _default_detector.timeout_settings
 kernel              = _default_detector.kernel
 stable_count        = _default_detector.stable_count        # 注意：这是引用，reset 后会变
-first_center        = _default_detector.first_center
-last_detection_time = _default_detector.last_detection_time
-color_history       = _default_detector.color_history
+color_stable_count  = _default_detector.color_stable_count  # 注意：这是引用，reset 后会变
+last_color          = _default_detector.last_color
 final_color         = _default_detector.final_color
 last_radius         = _default_detector.last_radius
-last_color_code     = _default_detector.last_color_code
 
 
 def block_preprocessing(frame, target=None):

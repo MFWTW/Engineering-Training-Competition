@@ -2,6 +2,7 @@ import cv2
 from pyzbar.pyzbar import decode
 
 session = []
+groups = []
 
 
 def scan_qrcode(thre_image, RAM_image):
@@ -30,11 +31,12 @@ def scan_qrcode(thre_image, RAM_image):
 
 def decode_data(data):
     numbers = data.split('+')
-    if len(numbers) == 4:
-        for num_group in numbers:
-            # 将每个数字分组中的每个数字单独加入 session
-            for digit in num_group:
-                session.append(digit)
+    groups.clear()
+    session.clear()
+    for num_group in numbers:
+        groups.append(num_group)
+        for digit in num_group:
+            session.append(digit)
 
 if __name__ == "__main__":
     scan_qrcode()

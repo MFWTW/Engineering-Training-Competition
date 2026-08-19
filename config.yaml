@@ -1,0 +1,265 @@
+# =====================================================================
+# config.yaml —— 本项目所有可调参数的集中配置文件
+# 修改后重启主程序（python src.py）生效。
+# 现有分段：
+#   colors     颜色 HSV 阈值 / 编号 / 形态学（felling_color.py 读取）
+#   detection  物块检测参数（felling_color.py 读取）
+#   tuner      颜色调试工具 ROI（hsv_tuner.py 读取）
+#   transformer 坐标转换/相机标定/夹爪行程（transformer.py 读取）
+#   kalman     卡尔曼滤波参数（kalman_tracker.py 读取）
+#   chassis    下位机 mm → 图像 px 换算（src.py 读取）
+#   control/tracking/display/protocol/safety/logging/planner
+#              src.py 主程序可调参数
+# =====================================================================
+
+# 6 种颜色：code 为发送给下位机的颜色编号，label 为中文名
+colors:
+  order:
+  - red
+  - green
+  - blue
+  - light_blue
+  - black
+  - yellow
+  red:
+    code: '1'
+    label: 红色
+    lower1:
+    - 0
+    - 123
+    - 118
+    upper1:
+    - 0
+    - 97
+    - 255
+    lower2:
+    - 158
+    - 132
+    - 83
+    upper2:
+    - 180
+    - 255
+    - 255
+    morph:
+      erode: 1
+      dilate: 2
+  green:
+    code: '2'
+    label: 绿色
+    lower:
+    - 69
+    - 127
+    - 54
+    upper:
+    - 92
+    - 255
+    - 158
+    morph:
+      erode: 2
+      dilate: 6
+  blue:
+    code: '3'
+    label: 蓝色
+    lower:
+    - 110
+    - 138
+    - 87
+    upper:
+    - 122
+    - 255
+    - 155
+    morph:
+      erode: 1
+      dilate: 3
+  light_blue:
+    code: '4'
+    label: 浅蓝
+    lower:
+    - 77
+    - 80
+    - 57
+    upper:
+    - 131
+    - 191
+    - 255
+    morph:
+      erode: 1
+      dilate: 3
+  black:
+    code: '5'
+    label: 黑色
+    lower:
+    - 0
+    - 0
+    - 0
+    upper:
+    - 180
+    - 107
+    - 105
+    morph:
+      erode: 1
+      dilate: 3
+  yellow:
+    code: '6'
+    label: 黄色
+    lower:
+    - 22
+    - 78
+    - 30
+    upper:
+    - 42
+    - 255
+    - 255
+    morph:
+      erode: 1
+      dilate: 3
+detection:
+  # ROI 检测区域 [x, y, w, h]；null=关闭 ROI（全图检测）。
+  # 注意：物块圆必须完整落在该区域内才算有效，被边缘切掉会直接判为无效。
+  # 开启方法：把下面改成矩形，例如 [120, 80, 400, 217]，
+  # 检测就只在该区域内进行，区域外（如自身车轮）不会被识别；
+  # 画面中会画出绿色矩形，可按实际位置调整。
+  # 注意：ROI 需完整包住物块活动区，否则物块被切边会导致面积/半径变小而被滤掉。
+  detection_area: [40, 100, 560, 350]   # 原来是 null320
+  kernel_size: 3
+  blur:
+    kernel: 5
+    sigma_x: 2
+    sigma_y: 2
+  circle:
+    min_radius: 33
+    max_radius: 60
+    param1: 25
+    param2: 25
+    min_area_factor: 0.2
+  stability:
+    threshold: 50
+    max_pixel_move: 20
+    color_stable_threshold: 5
+  timeout_ms: 100
+tuner:
+  roi:
+  - 120
+  - 80
+  - 400
+  - 217
+
+# ---- 坐标转换 / 相机标定 / 夹爪行程（transformer.py 读取） ----
+transformer:
+  # 摄像头光心相对世界坐标（车中心）的位置，单位 cm：[x, y, z]
+  camera1world_coordinate: [0, 21.595, 20]
+  # 夹爪中心距车中心的最远/最近距离（cm），z 轴忽略
+  max_jar_dis: [0, 30.005, 0]
+  min_jar_dis: [0, 21.595, 0]
+  # 左右对齐容差（cm）：按当前相机高度 20cm、物块高 14.3cm 换算，
+  # 1cm ≈ 64px；要保证 x 轴 ≤5px，这里需远小于 0.08cm，故取 0.05cm（≈3px）
+  lateral_tolerance_cm: 0.02
+  longitudinal_tolerance_cm: 0.5
+  # 相机标定原图分辨率（内参基准，实际出图分辨率不同时自动按比例缩放）
+  calib_image_width: 640
+  calib_image_height: 480
+  # 相机内参（像素），来自 camera_calibration.json；
+  # 标定脚本加 --update-transformer 会自动写回下面这些值
+  focal_px_x: 366.99093917961704
+  focal_px_y: 364.25895585724794
+  principal_px_x: 314.8605084989312
+  principal_px_y: 247.66418301001914
+  dist_coeffs: [-0.012076444385052124, 0.0016723981571138394, 0.0018108447968222718, -0.002827491845898441, -0.024264465499757897]
+  # 相机光心离地高度（cm）
+  camera_height_cm: 20
+  # 物块顶面高度（cm）：抓取区立放物块用这个值（检测点是物块顶面）
+  block_height_cm: 14.3
+  # 已放置（躺倒）后再次夹取时物块顶面高度（cm）
+  block_height_placed_cm: 6.0
+  # 相机俯仰角（度），正=向下俯拍；光轴垂直于地面（垂直向下）时填 90
+  camera_pitch_deg: 94
+
+# ---- 位置平滑滤波算法选择（src.py 读取） ----
+filter:
+  # 可选值：none=不滤波（直接用检测中心）/ kalman=6维卡尔曼 / one_euro=一欧元低通
+  # 一欧元低通特点是：慢速时平滑去抖、快速时低滞后跟手，适合改善“卡顿感”。
+  type: none
+
+one_euro:
+  min_cutoff: 0.8        # 最小截止频率（Hz），越小越平滑；太小时静止目标会显得“拖”
+  beta: 0.05             # 速度自适应系数，越大高速时越跟手；0=退化为固定截止频率低通
+  d_cutoff: 0.4          # 速度估计截止频率（Hz），通常 0.3~1.0
+  velocity_window: 12    # 速度最小二乘拟合窗口（帧），越大速度越稳，变向响应越慢
+  dt_min_s: 0.005        # 帧间隔下限（秒），防止异常小的 dt
+  dt_max_s: 0.2          # 帧间隔上限（秒），暂停/卡顿后不会一次跳太多
+
+kalman:
+  enabled: true            # 仅在 filter.type=kalman 时生效（旧配置兼容默认值）
+  dt: 0.03333333333333333
+  initial_p: 100.0
+  q_acc: 8.0               # 越小越平滑（滤波更信任模型）；太小会显得拖沓
+  meas_std: 10.0           # 越大越平滑（更信任测量是噪声）；太大同样会拖沓
+  history_len: 100
+  predict:
+    horizon_s: 2.0
+    steps: 6
+  visualize:
+    enabled: true            # 总开关：false 时关闭所有卡尔曼调试绘制
+    draw_raw: true           # 原始测量圈（细圈+灰点）
+    draw_filtered: true      # 滤波后位置（粗圈+实心点）
+    draw_trajectory: true    # 未来预测轨迹（horizon_s / steps 控制）
+    draw_intercept: true     # 拦截点（红色箭头+点）
+    draw_speed: true         # 滤波速度文字 V=xx px/s
+    draw_history: true       # 历史滤波轨迹线
+    history_trail_len: 60    # 历史轨迹保留最近 N 帧（≤ history_len）
+chassis:
+  px_per_mm: 0.1             #0.165  下位机 mm/mm/s → 图像 px/px/s 的换算倍率（用 calibrate_px_per_mm.py 标定）
+
+# =====================================================================
+# 以下为 src.py 主程序可调参数（原 src.py 中的硬编码常量）
+# =====================================================================
+
+# ---- 目标切换与对准 ----
+control:
+  mode: manual                 # 切换模式：manual=手动（按 n/空格）；其他值=自动
+  auto_switch_timeout: 10.0    # 非 manual 模式：等待 finish_capture 的超时兜底切换（秒）
+  center_tolerance_px: 20      # x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求抓取/放置
+
+# ---- 指令发送节流 / 死区 / 心跳 ----
+tracking:
+  capture_resend_interval: 1.0 # 等待抓取时未收到 capture_ack，重发 capture=1 的间隔（秒）
+  send_interval: 0.05            # 普通跟踪/对准指令（capture=0）最小发送间隔（秒），越小指令越连贯
+  chassis_p_gain: 0.9          # 底盘比例增益：目标偏移先乘以该系数再下发，越靠近移动量越小
+  chassis_send_deadband_mm: 0.25   # 底盘指令变化死区（mm）：目标偏移变化小于该值不重发，避免增量执行被打断
+  gripper_deadband_mm: 5       # 夹爪指令死区（mm）
+  chassis_ramp_step_mm: 9      # 平滑跟踪：每个发送周期指令变化量上限（mm），按 send_interval 标定
+  send_heartbeat: 2         # 普通跟踪包心跳间隔（秒），应大于 send_interval；null=禁用
+
+# ---- 显示窗口 ----
+display:
+  max_width: 800               # 显示窗口最大宽度（px），超过按同比例缩小，仅影响显示
+  max_height: 540              # 显示窗口最大高度（px）
+  serial_overlay:
+    enabled: true              # 在画面左下角叠加显示串口收发信息（只用英文/数字，避免 OpenCV 中文乱码）
+    max_lines: 4               # TX / RX 各保留并显示最近 N 条
+
+# ---- 串口协议动作码（与下位机协议约定，一般不要改） ----
+protocol:
+  idle_action: 0               # action=0：启动/空闲
+  grab_action: 1               # action=1：抓取模式
+  place_action: 2              # action=2：放置模式
+
+# ---- 指令保护 ----
+safety:
+  max_chassis_cmd_mm: 2000     # 底盘单轴指令合理范围上限（mm），越界沿用上一帧有效指令
+  max_gripper_mm: 400          # 夹爪伸长量合理范围上限（mm）
+  max_chassis_step_mm: 30      # 普通跟踪包单次底盘移动量上限（mm），防止一次给全量偏移过冲
+
+# ---- 日志打印节流 ----
+logging:
+  command_print_interval: 0.5  # 指令打印最小间隔（秒），数值变化或超过间隔才打印
+  warn_interval_s: 1.0         # “坐标无效/命令全0”警告打印最小间隔（秒）
+
+# ---- 拦截规划器（InterceptPlanner） ----
+planner:
+  car_max_speed_px_per_s: 200.0   # 小车最大速度（px/s）
+  car_accel_px_per_s2: 100.0      # 小车加速度（px/s²）
+  car_decel_px_per_s2: 150.0      # 小车减速度（px/s²），影响刹车距离
+  time_resolution_s: 0.02         # T 搜索步长（秒）
+  max_predict_time_s: 5.0         # 最大预测时间（秒），超过视为无法拦截
+  tolerance_s: 0.1                # 收敛容差（秒）：|T_car - T| ≤ 该值认为可行

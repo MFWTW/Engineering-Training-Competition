@@ -1,16 +1,18 @@
 """
-MNIST 手写数字识别 —— 海康摄像头实时采集 + 模型推理
+MNIST 手写数字识别 —— USB 摄像头实时采集 + 模型推理
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import cv2
 import numpy as np
-import sys
 import time
 
-from hikrobot_camera import (
-    enum_devices, create_camera_handle, start_grabbing, read_frame,
+from common_camera import (
+    open_camera,
+    DETECTION_CAMERA_SOURCE,
+    DETECTION_FRAME_WIDTH,
+    DETECTION_FRAME_HEIGHT,
 )
 
 
@@ -193,26 +195,19 @@ def predict_digit(model, tensor, device):
     return pred, confidence
 
 
-# ===================== 海康摄像头实时识别 =====================
+# ===================== USB 摄像头实时识别 =====================
 
-def hik_camera_recognition(model, device, cam_index=0, width=1440, height=1080):
-    """
-    海康摄像头实时采集 + MNIST 数字识别
-    """
-    # 1. 枚举并打开海康摄像头
-    dev_list = enum_devices()
-    if dev_list is None:
-        print("未检测到海康摄像头！")
-        return
-
-    cam = create_camera_handle(dev_list, cam_index, width=width, height=height)
-    if cam is None:
-        return
-
-    if not start_grabbing(cam):
-        print("启动取流失败！")
-        cam.MV_CC_CloseDevice()
-        cam.MV_CC_DestroyHandle()
+def usb_camera_recognition(
+    model,
+    device,
+    camera_source=DETECTION_CAMERA_SOURCE,
+    width=DETECTION_FRAME_WIDTH,
+    height=DETECTION_FRAME_HEIGHT,
+):
+    """USB 摄像头实时采集 + MNIST 数字识别"""
+    cap = open_camera(camera_source, width=width, height=height)
+    if cap is None:
+        print("未检测到 USB 摄像头！")
         return
 
     print("\n开始实时识别，按 'q' 退出，按 's' 截图保存\n")
@@ -220,9 +215,9 @@ def hik_camera_recognition(model, device, cam_index=0, width=1440, height=1080):
     try:
         while True:
             # 2. 读取一帧
-            frame = read_frame(cam)  # 灰度图 (Mono8) 或 BGR 图
+            ret, frame = cap.read()
 
-            if frame is None:
+            if not ret or frame is None:
                 continue
 
             # 3. 若为彩色图则转为灰度
@@ -276,10 +271,7 @@ def hik_camera_recognition(model, device, cam_index=0, width=1440, height=1080):
         print("\n用户中断")
 
     finally:
-        # 8. 清理资源
-        cam.MV_CC_StopGrabbing()
-        cam.MV_CC_CloseDevice()
-        cam.MV_CC_DestroyHandle()
+        cap.release()
         cv2.destroyAllWindows()
         print("资源已释放")
 
@@ -288,5 +280,4 @@ def hik_camera_recognition(model, device, cam_index=0, width=1440, height=1080):
 
 if __name__ == "__main__":
     model, device = load_mnist_model()
-    hik_camera_recognition(model, device)
-
+    usb_camera_recognition(model, device)

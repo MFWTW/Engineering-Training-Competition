@@ -5,6 +5,22 @@
 
 import numpy as np
 from collections import deque
+from pathlib import Path
+
+import yaml
+
+
+CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+
+
+def _load_kalman_config():
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return cfg["kalman"]
+
+
+# 卡尔曼滤波调参变量统一从 config.yaml 读取
+KALMAN_CFG = _load_kalman_config()
 
 
 class KalmanBlockTracker:
@@ -20,17 +36,21 @@ class KalmanBlockTracker:
         ix, iy = kf.compute_intercept(car_speed) # 解算拦截点
     """
 
-    def __init__(self, dt: float = 1.0 / 30.0):
+    def __init__(self, dt: float = None, q_acc: float = None,
+                 meas_std: float = None, initial_p: float = None,
+                 history_len: int = None):
         """
-        dt: 帧间时间间隔（秒），如 30fps → 1/30 ≈ 0.0333
+        dt: 帧间时间间隔（秒），如 30fps → 1/30 ≈ 0.0333；
+            未传时使用 config.yaml 中 kalman 段的默认值
         """
-        self.dt = dt
+        self.dt = KALMAN_CFG["dt"] if dt is None else dt
 
         # ── 状态向量 X = [x, y, vx, vy, ax, ay] ──
         self.X = np.zeros((6, 1), dtype=np.float64)
 
         # ── 状态协方差矩阵 P ──
-        self.P = np.eye(6, dtype=np.float64) * 100.0
+        init_p = KALMAN_CFG["initial_p"] if initial_p is None else initial_p
+        self.P = np.eye(6, dtype=np.float64) * init_p
 
         # ── 状态转移矩阵 F (6×6) ──
         self.F = np.eye(6, dtype=np.float64)
@@ -43,22 +63,22 @@ class KalmanBlockTracker:
 
         # ── 过程噪声协方差 Q ──
         # 加速度的变化是主要噪声源
-        q_acc = 5.0  # 加速度噪声 (px/s²)²
-        dt2 = dt * dt / 2.0
+        q_acc = KALMAN_CFG["q_acc"] if q_acc is None else q_acc
+        dt2 = self.dt * self.dt / 2.0
         self.Q = np.zeros((6, 6), dtype=np.float64)
         # 位置受加速度噪声影响：0.5*a*dt²
         self.Q[0, 0] = q_acc * dt2 ** 2
         self.Q[1, 1] = q_acc * dt2 ** 2
         # 速度受加速度噪声影响：a*dt
-        self.Q[2, 2] = q_acc * dt ** 2
-        self.Q[3, 3] = q_acc * dt ** 2
+        self.Q[2, 2] = q_acc * self.dt ** 2
+        self.Q[3, 3] = q_acc * self.dt ** 2
         # 加速度自身
         self.Q[4, 4] = q_acc
         self.Q[5, 5] = q_acc
 
         # ── 测量噪声协方差 R ──
         # 视觉检测的抖动（像素²）
-        meas_std = 8.0  # 测量标准差（像素）
+        meas_std = KALMAN_CFG["meas_std"] if meas_std is None else meas_std
         self.R = np.eye(2, dtype=np.float64) * (meas_std ** 2)
 
         # ── 身份矩阵 ──
@@ -69,7 +89,8 @@ class KalmanBlockTracker:
         self.last_update_time: float | None = None
 
         # 历史记录（调试用）
-        self.history = deque(maxlen=100)
+        hist_len = KALMAN_CFG["history_len"] if history_len is None else history_len
+        self.history = deque(maxlen=hist_len)
 
     def _update_F(self):
         """更新状态转移矩阵（dt 变化时调用）"""
@@ -160,7 +181,7 @@ class KalmanBlockTracker:
 
     # ==================== 未来轨迹预测 ====================
 
-    def predict_future(self, T: float, steps: int = 1) -> list:
+    def predict_future(self, T: float = None, steps: int = None) -> list:
         """
         前向推算 T 秒后的位置（以及中间步）。
         x_future = x + vx*T + 0.5*ax*T²
@@ -168,6 +189,10 @@ class KalmanBlockTracker:
 
         Returns: [(x1,y1), ..., (xN,yN)] for N steps evenly spaced to T
         """
+        if T is None:
+            T = float(KALMAN_CFG["predict"]["horizon_s"])
+        if steps is None:
+            steps = int(KALMAN_CFG["predict"]["steps"])
         x, y, vx, vy, ax, ay = self.get_state()
         result = []
         for i in range(1, steps + 1):
@@ -199,7 +224,7 @@ class KalmanBlockTracker:
     def reset(self):
         """重置滤波器"""
         self.X = np.zeros((6, 1), dtype=np.float64)
-        self.P = np.eye(6, dtype=np.float64) * 100.0
+        self.P = np.eye(6, dtype=np.float64) * KALMAN_CFG["initial_p"]
         self.initialized = False
         self.last_update_time = None
         self.history.clear()

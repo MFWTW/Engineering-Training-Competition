@@ -5,38 +5,39 @@ import time
 import logging
 from typing import List, Optional
 
-PACK_FORMAT = "<2B B 4H H H B H 2B"  # 小端: head(2B) target(1B) QR(8B) x(2B) y(2B) color(1B) radius(2B) tail(2B)
-PACK_SIZE = struct.calcsize(PACK_FORMAT)  # 20 字节
+PACK_FORMAT = "<2B B B B h h H 2B"  # 小端: head(2B) target(1B) action(1B) capture(1B) chassis_x(2B) chassis_y(2B) gripper(2B) tail(2B)
+PACK_SIZE = struct.calcsize(PACK_FORMAT)  # 13 字节
 
 logger = logging.getLogger("Gimbal")
 
+
 class VisionToGimbal:
-    def __init__(self, target: int = 0, QR: List[int] = [0, 0, 0, 0], x: int = 0, y: int = 0, color: int = 0, radius: int = 0):
+    def __init__(self, target: int = 0, action: int = 0, capture: bool = False,
+                 chassis_x_mm: int = 0, chassis_y_mm: int = 0, gripper_mm: int = 0):
         self.head: bytes = b"\x53\x50"
         self.target_: int = target          # uint8_t, 0~255
-        self.QR_: List[int] = QR            # uint16_t × 4, 0~65535
-        self.x_: int = x                    # uint16_t, 0~65535
-        self.y_: int = y                    # uint16_t, 0~65535
-        self.color_: int = color            # uint8_t, 0~255
-        self.radius_: int = radius          # uint16_t, 0~65535
+        self.action_: int = int(action)     # uint8_t, 0=启动/空闲, 1=抓取, 2=放置
+        self.capture_: int = 1 if capture else 0  # uint8_t, 0=跟踪中/未抓取, 1=请求抓取
+        self.chassis_x_mm: int = int(chassis_x_mm)  # int16_t，底盘左右移动量，正=左，负=右
+        self.chassis_y_mm: int = int(chassis_y_mm)  # int16_t，底盘前后移动量，正=前，负=后
+        self.gripper_mm: int = int(gripper_mm)      # uint16_t，夹爪伸出距离
         self.tail: bytes = b"\xAA\x66"
 
     def pack(self) -> bytes:
-        """序列化二进制：head + target + QR[] + x + y + color + radius + tail"""
-        qr = [int(x) for x in self.QR_[:4]]
+        """序列化二进制：head + target + action + capture + 底盘/夹爪 + tail"""
+        capture = 1 if self.capture_ else 0
         data = struct.pack(
             PACK_FORMAT,
             self.head[0], self.head[1],
             self.target_,
-            qr[0], qr[1], qr[2], qr[3],
-            self.x_, self.y_,
-            self.color_,
-            self.radius_,
+            self.action_,
+            capture,
+            self.chassis_x_mm, self.chassis_y_mm, self.gripper_mm,
             self.tail[0], self.tail[1]
         )
         logger.info(
-            f"[发送包] target={self.target_} QR={qr} "
-            f"x={self.x_} y={self.y_} color={self.color_} radius={self.radius_} "
+            f"[发送包] target={self.target_} action={self.action_} capture={capture} "
+            f"chassis=({self.chassis_x_mm},{self.chassis_y_mm})mm gripper={self.gripper_mm}mm "
             f"hex={data.hex(' ')} len={len(data)}"
         )
         return data
@@ -44,26 +45,38 @@ class VisionToGimbal:
 class GimbalToVision:
     """底盘→上位机 数据接收与解析"""
 
-    RECV_FORMAT = "<2B B H H h 2B"  # head(2) target(1) chassis_x(2) chassis_y(2) theta(2) tail(2)
-    RECV_SIZE = struct.calcsize(RECV_FORMAT)  # 11 字节
+    RECV_FORMAT = "<2B H H h h B B B 2B"  # head(2) chassis_x(2) chassis_y(2) chassis_vx(2) chassis_vy(2) capture_ack(1) finish_capture(1) arrived(1) tail(2)
+    RECV_SIZE = struct.calcsize(RECV_FORMAT)  # 15 字节
 
-    def __init__(self, target: int = 0, chassis_x: int = 0, chassis_y: int = 0, theta: int = 0):
+    def __init__(self, chassis_x: int = 0, chassis_y: int = 0,
+                 chassis_vx: int = 0, chassis_vy: int = 0,
+                 capture_ack: int = 0, finish_capture: int = 0, arrived: int = 0):
         self.head: bytes = b"\x53\x50"
-        self.target_: int = target          # uint8_t
-        self.chassis_x: int = chassis_x      # uint16_t，底盘 X
-        self.chassis_y: int = chassis_y      # uint16_t，底盘 Y
-        self.theta: int = theta              # int16_t，底盘航向角（度×10 或 原始值）
+        self.chassis_x: int = chassis_x      # uint16_t，底盘 X（mm）
+        self.chassis_y: int = chassis_y      # uint16_t，底盘 Y（mm）
+        self.chassis_vx: int = chassis_vx    # int16_t，底盘速度 X 分量（mm/s）
+        self.chassis_vy: int = chassis_vy    # int16_t，底盘速度 Y 分量（mm/s）
+        self.capture_ack: int = int(capture_ack)        # uint8_t, 1=下位机已收到抓取请求
+        self.finish_capture: int = int(finish_capture)  # uint8_t, 1=下位机抓取完成
+        self.arrived: int = int(arrived)                # uint8_t, 1=已到达指定区域
         self.tail: bytes = b"\xAA\x66"
         self.timestamp: float = 0.0          # 上位机收到时的时间戳（秒）
+
+    @property
+    def chassis_speed(self) -> float:
+        """底盘实际速率（原始值单位，与 vx/vy 相同）"""
+        return (self.chassis_vx ** 2 + self.chassis_vy ** 2) ** 0.5
 
     def pack(self) -> bytes:
         """序列化二进制（向底盘发送确认/指令时用）"""
         return struct.pack(
             self.RECV_FORMAT,
             self.head[0], self.head[1],
-            self.target_,
             self.chassis_x, self.chassis_y,
-            self.theta,
+            self.chassis_vx, self.chassis_vy,
+            self.capture_ack,
+            self.finish_capture,
+            self.arrived,
             self.tail[0], self.tail[1],
         )
 
@@ -73,12 +86,17 @@ class GimbalToVision:
         if len(data) < cls.RECV_SIZE:
             return None
         try:
-            h0, h1, target, cx, cy, theta, t0, t1 = struct.unpack(cls.RECV_FORMAT, data[:cls.RECV_SIZE])
+            h0, h1, cx, cy, vx, vy, capture_ack, finish_capture, arrived, t0, t1 = struct.unpack(
+                cls.RECV_FORMAT, data[:cls.RECV_SIZE]
+            )
             if h0 != 0x53 or h1 != 0x50:
                 return None
             if t0 != 0xAA or t1 != 0x66:
                 return None
-            result = cls(target=target, chassis_x=cx, chassis_y=cy, theta=theta)
+            result = cls(chassis_x=cx, chassis_y=cy,
+                         chassis_vx=vx, chassis_vy=vy,
+                         capture_ack=capture_ack, finish_capture=finish_capture,
+                         arrived=arrived)
             result.timestamp = time.time()
             return result
         except struct.error:
@@ -194,7 +212,7 @@ class SerialComm:
             self.connected_ = False
             return False
         
-    def read(self, size: int = 13) -> bytes:
+    def read(self, size: int = GimbalToVision.RECV_SIZE) -> bytes:
         """读取数据，如果断开则自动重连"""
         if not self.connected_ or not self.ser or not self.ser.is_open:
             logger.warning("[Gimbal] Serial not connected, attempting reconnect...")
@@ -233,7 +251,7 @@ class SerialComm:
             return self._latest_chassis
 
     def _chassis_recv_loop(self):
-        """接收线程主循环：按 9 字节帧解析底盘数据"""
+        """接收线程主循环：按 15 字节帧解析底盘数据"""
         buf = b""
         while not self.quit_:
             try:

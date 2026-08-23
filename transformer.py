@@ -76,6 +76,9 @@ camera1world_coordinate = _cfg_list("camera1world_coordinate", [0, 24.49, 20])
 # 架爪中心距离车中心的最远/最近距离，z 轴忽略（下位机夹的时候写死高度）
 max_jar_dis = _cfg_list("max_jar_dis", [0, 30.005, 0])
 min_jar_dis = _cfg_list("min_jar_dis", [0, 21.595, 0])
+# 夹爪最长行程（cm / mm）：放置阶段夹爪固定最长时使用
+MAX_GRIPPER_EXTEND_CM = max_jar_dis[1] - min_jar_dis[1]
+MAX_GRIPPER_EXTEND_MM = int(round(MAX_GRIPPER_EXTEND_CM * 10))
 
 # 左右对齐容差（cm），小于该值认为已经对齐；
 # 注意按相机高度/物块高度换算，1cm 在画面里可能对应几十像素，取太大会让
@@ -311,12 +314,14 @@ def world_to_camera(world_coordinate_point, gripper_extension_cm=0.0):
     ]
 
 
-def decide_gripper_chassis(block_world):
+def decide_gripper_chassis(block_world, fixed_gripper_cm=None):
     """
     根据物块的世界坐标，输出夹爪目标距离和底盘移动指令。
 
     Args:
         block_world: [x, y, z]，物块在世界系中的坐标（cm）
+        fixed_gripper_cm: 固定夹爪位置（相对车中心，cm）。
+            不为 None 时夹爪长度不再参与决策，只靠底盘把目标带到该位置。
 
     Returns:
         dict:
@@ -348,7 +353,11 @@ def decide_gripper_chassis(block_world):
         chassis_x_direction = "left" if dx > 0 else "right"
 
     # ---- 前后距离决策 ----
-    if dy < min_y:
+    if fixed_gripper_cm is not None:
+        # 固定夹爪：只调底盘，夹爪目标就是固定位置
+        target_gripper_y = min(max(float(fixed_gripper_cm), min_y), max_y)
+        mode = "fixed_gripper"
+    elif dy < min_y:
         mode = "too_close"
         target_gripper_y = min_y
     elif dy > max_y:
@@ -377,19 +386,24 @@ def decide_gripper_chassis(block_world):
     }
 
 
-def decide_from_camera(camera_coordinate, gripper_extension_cm=0.0):
+def decide_from_camera(camera_coordinate, gripper_extension_cm=0.0,
+                       fixed_gripper_cm=None):
     """直接传入物块在相机坐标系中的坐标 [x, y, z]，内部先转世界系再决策"""
     block_world = camera_to_world(
         camera_coordinate, gripper_extension_cm=gripper_extension_cm
     )
     if block_world is None:
         return None
-    return decide_gripper_chassis(block_world)
+    return decide_gripper_chassis(block_world, fixed_gripper_cm=fixed_gripper_cm)
 
 
-def command_to_protocol_mm(camera_coordinate, gripper_extension_cm=0.0):
+def command_to_protocol_mm(camera_coordinate, gripper_extension_cm=0.0,
+                           fixed_gripper_cm=None):
     """
     把决策结果转成串口需要的整数值（单位 mm，1mm 分辨率）。
+
+    fixed_gripper_cm: 固定夹爪位置（相对车中心，cm）；放置阶段传夹爪最长位置，
+        则夹爪指令固定为最长，只输出底盘移动量。
 
     Returns:
         (chassis_x_mm, chassis_y_mm, gripper_mm)
@@ -398,7 +412,9 @@ def command_to_protocol_mm(camera_coordinate, gripper_extension_cm=0.0):
         实际夹爪位置 = min_jar_dis[1] + gripper_mm/10（相对车中心）。
     """
     result = decide_from_camera(
-        camera_coordinate, gripper_extension_cm=gripper_extension_cm
+        camera_coordinate,
+        gripper_extension_cm=gripper_extension_cm,
+        fixed_gripper_cm=fixed_gripper_cm,
     )
     if result is None:
         return 0, 0, 0

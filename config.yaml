@@ -33,9 +33,9 @@ colors:
     - 97
     - 255
     lower2:
-    - 158
+    - 137
     - 132
-    - 83
+    - 44
     upper2:
     - 180
     - 255
@@ -44,16 +44,16 @@ colors:
       erode: 1
       dilate: 2
   green:
-    code: '2'
+    code: '4'
     label: 绿色
     lower:
-    - 69
-    - 127
-    - 54
+    - 45
+    - 125
+    - 0
     upper:
-    - 92
+    - 73
     - 255
-    - 158
+    - 255
     morph:
       erode: 2
       dilate: 6
@@ -61,26 +61,26 @@ colors:
     code: '3'
     label: 蓝色
     lower:
-    - 110
-    - 138
-    - 87
+    - 112
+    - 68
+    - 16
     upper:
-    - 122
+    - 136
     - 255
-    - 155
+    - 145
     morph:
       erode: 1
       dilate: 3
   light_blue:
-    code: '4'
+    code: '6'
     label: 浅蓝
     lower:
-    - 77
-    - 80
-    - 57
+    - 86
+    - 81
+    - 40
     upper:
-    - 131
-    - 191
+    - 107
+    - 255
     - 255
     morph:
       erode: 1
@@ -100,14 +100,14 @@ colors:
       erode: 1
       dilate: 3
   yellow:
-    code: '6'
+    code: '2'
     label: 黄色
     lower:
-    - 22
-    - 78
-    - 30
+    - 0
+    - 89
+    - 37
     upper:
-    - 42
+    - 37
     - 255
     - 255
     morph:
@@ -119,8 +119,8 @@ detection:
   # 开启方法：把下面改成矩形，例如 [120, 80, 400, 217]，
   # 检测就只在该区域内进行，区域外（如自身车轮）不会被识别；
   # 画面中会画出绿色矩形，可按实际位置调整。
-  # 注意：ROI 需完整包住物块活动区，否则物块被切边会导致面积/半径变小而被滤掉。
-  detection_area: [40, 100, 560, 350]   # 原来是 null320
+  # 检测只要求圆心落在 ROI 内；靠近边缘时形态学膨胀导致的圆外扩不再被拒。
+  detection_area: [40, 0, 560, 350]   # 原来是 null320[40, 100, 560, 350]
   kernel_size: 3
   blur:
     kernel: 5
@@ -128,33 +128,64 @@ detection:
     sigma_y: 2
   circle:
     min_radius: 33
-    max_radius: 60
+    max_radius: 75
     param1: 25
     param2: 25
     min_area_factor: 0.2
   stability:
-    threshold: 50
-    max_pixel_move: 20
+    threshold: 35
+    max_pixel_move: 6        # 相邻帧圆心最大位移（px），约 1mm；必须连续 35 帧内抖动小于该值才算稳定
     color_stable_threshold: 5
   timeout_ms: 100
 tuner:
   roi:
-  - 120
-  - 80
-  - 400
-  - 217
+  - 40
+  - 0
+  - 560
+  - 350
+
+# ---- 放置区识别参数（placement.py 读取） ----
+placement:
+  model_path: /home/xu/Engineer/tiny_digit_cnn.pth  # 数字识别模型路径
+  gripper_fixed: min          # 放置时夹爪策略：min=固定最短(0mm伸长)只调底盘；max=固定最长只调底盘；dynamic=与抓取一样动态调夹爪
+  gripper_fixed_mm: 30        # 自定义固定伸长量（mm）：非空时优先生效，固定伸长只调底盘；null=按 gripper_fixed
+  debug: true                # true=打印圆环/数字识别调试日志（约1秒1条）
+  show_debug: true           # true=弹窗显示二值化/闭运算/圆环/数字裁剪处理过程
+  digit_crop_ratio: 0.7       # 最内层圆环内数字裁剪比例（相对半径）
+  min_ring_radius: 10         # 圆环最小半径（px）
+  min_ring_area: 350          # 圆环最小面积（px²）
+  ring_circularity: 0.6       # 圆环圆度下限（4πA/P²）
+  min_digit_confidence: 0.6   # 数字识别最低置信度
+  ring_group_overlap: 0.8     # 同心圆分组判定系数（中心距离 < 最大半径×该值）
+  morph_kernel_size: 5        # 二值化后闭运算核大小
+  min_crop_px: 12             # 数字裁剪最小半径（px）
+  record_placement_order: true  # true=按实际放置顺序追加记录到文件
+  placement_order_log: /home/xu/Engineer/placement_order.log  # 放置顺序记录文件
+  # 放置阶段位置稳定条件：同一圆环连续 N 帧且圆心位移 < 阈值才允许放置
+  place_stable_threshold: 10          # 位置连续稳定帧数
+  place_stable_max_pixel_move: 10     # 相邻帧圆心最大位移（px）
+  # ---- 托盘阶段（放置完成后抓取托盘上的物块，复用抓取视觉跟踪逻辑） ----
+  tray_phase_enabled: true          # true=放置完成后进入托盘阶段
+  tray_phase_order: reverse          # actual=按实际放置顺序抓取；reverse=倒序抓取
+  tray_phase_action: 1              # 托盘抓取动作码（1=抓取），保留兼容
+  tray_phase_capture: true          # 已废弃：托盘抓取走视觉跟踪，capture 由稳定+对准决定
+  tray_phase_skip_last_of_round: true  # true=每轮最后一次放置不需要夹起，直接进入下一轮
+  # 托盘阶段夹爪策略：dynamic/null=与抓取一样动态调夹爪；
+  # min=固定最短、max=固定最长、数字=固定伸长mm（如 30）。机构响应慢时动态夹爪
+  # 会因“相机随夹爪伸缩 → 测量滞后”震荡，建议固定夹爪只靠底盘对准。
+  tray_gripper_fixed: 30
 
 # ---- 坐标转换 / 相机标定 / 夹爪行程（transformer.py 读取） ----
 transformer:
   # 摄像头光心相对世界坐标（车中心）的位置，单位 cm：[x, y, z]
   camera1world_coordinate: [0, 21.595, 20]
   # 夹爪中心距车中心的最远/最近距离（cm），z 轴忽略
-  max_jar_dis: [0, 30.005, 0]
+  max_jar_dis: [0, 40.005, 0]
   min_jar_dis: [0, 21.595, 0]
   # 左右对齐容差（cm）：按当前相机高度 20cm、物块高 14.3cm 换算，
   # 1cm ≈ 64px；要保证 x 轴 ≤5px，这里需远小于 0.08cm，故取 0.05cm（≈3px）
   lateral_tolerance_cm: 0.02
-  longitudinal_tolerance_cm: 0.5
+  longitudinal_tolerance_cm: 0.1
   # 相机标定原图分辨率（内参基准，实际出图分辨率不同时自动按比例缩放）
   calib_image_width: 640
   calib_image_height: 480
@@ -208,7 +239,7 @@ kalman:
     draw_history: true       # 历史滤波轨迹线
     history_trail_len: 60    # 历史轨迹保留最近 N 帧（≤ history_len）
 chassis:
-  px_per_mm: 0.1             #0.165  下位机 mm/mm/s → 图像 px/px/s 的换算倍率（用 calibrate_px_per_mm.py 标定）
+    px_per_mm: 0.14            #0.165  下位机 mm/mm/s → 图像 px/px/s 的换算倍率（用 calibrate_px_per_mm.py 标定）
 
 # =====================================================================
 # 以下为 src.py 主程序可调参数（原 src.py 中的硬编码常量）
@@ -218,7 +249,10 @@ chassis:
 control:
   mode: manual                 # 切换模式：manual=手动（按 n/空格）；其他值=自动
   auto_switch_timeout: 10.0    # 非 manual 模式：等待 finish_capture 的超时兜底切换（秒）
-  center_tolerance_px: 20      # x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求抓取/放置
+  skip_grab: false             # true=扫描二维码后跳过抓取，直接前往放置区（物块已就位、单独调放置）
+  grab_only: true             # true=扫描二维码后只调试抓取：抓完当前轮即退出，跳过放置阶段
+  grab_center_tolerance_px: 20  # 抓取阶段 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求抓取
+  place_center_tolerance_px: 8  # 放置阶段 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求放置
 
 # ---- 指令发送节流 / 死区 / 心跳 ----
 tracking:
@@ -227,6 +261,8 @@ tracking:
   chassis_p_gain: 0.9          # 底盘比例增益：目标偏移先乘以该系数再下发，越靠近移动量越小
   chassis_send_deadband_mm: 0.25   # 底盘指令变化死区（mm）：目标偏移变化小于该值不重发，避免增量执行被打断
   gripper_deadband_mm: 5       # 夹爪指令死区（mm）
+  gripper_gain: 0.2            # 夹爪比例增益：夹爪机构响应慢，每帧只修正测距差值的 20%，防闭环震荡
+  gripper_ramp_step_mm: 3      # 夹爪指令每个发送周期变化量上限（mm），避免 0→84mm 一次顶满
   chassis_ramp_step_mm: 9      # 平滑跟踪：每个发送周期指令变化量上限（mm），按 send_interval 标定
   send_heartbeat: 2         # 普通跟踪包心跳间隔（秒），应大于 send_interval；null=禁用
 

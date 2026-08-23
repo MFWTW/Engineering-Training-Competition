@@ -54,34 +54,124 @@
 
 ## 一、主程序 `src.py` —— 物块识别追踪闭环
 
-### 工作流程（两轮抓取 + 放置）
+### 工作流程（QR 4 组 → 2 轮，每轮“抓取→放置”重复 2 次）
 
-1. **QR 扫描阶段**：USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码二维码
-   （形如 `156+123+516+231`，4 组数字）→ 解析为两轮任务：
-   - 第 1 组：第 1 轮抓取颜色序列；
-   - 第 2 组：第 1 轮放置编号；
-   - 第 3 组：第 2 轮抓取颜色序列；
-   - 第 4 组：第 2 轮放置编号。
-2. **抓取阶段**：关闭二维码 USB 摄像头，切换到另一路物块检测 USB 摄像头；严格按抓取序列顺序，
-   每帧只检测当前目标颜色（仅构建该颜色的 HSV 掩膜，减少计算量），
-   识别到后跟踪并抓取，抓到的物块按“颜色 → 槽位”映射放入对应槽位；
-3. **放置阶段**：本轮物块全部抓完后，下位机移动到放置区并回传 `arrived=1`；
-   上位机识别同心圆环最内层数字，数字 n → 按“槽位 → 圆环编号”映射取出对应物块放置到该位置；
-   三个位置全部放完后进入下一轮，全部轮次完成则退出。
+以二维码 `156+123+425+231` 为例，4 组数的含义：
+
+- 第 1 组：第 1 轮抓取颜色序列 `156`；
+- 第 2 组：第 1 轮放置编号 `123`；
+- 第 3 组：第 2 轮抓取颜色序列 `425`；
+- 第 4 组：第 2 轮放置编号 `231`。
+
+每轮“抓取 → 放置”完整执行 **2 遍**（`repeat=2`），即实际顺序为：
+
+```
+第 1 轮：156 抓取 → 123 放置 → 156 抓取 → 123 放置
+第 2 轮：425 抓取 → 231 放置 → 425 抓取 → 231 放置
+```
+
+屏幕叠加显示仍保持二维码扫到的 4 组原始数字。
+
+#### ① QR 扫描阶段
+
+USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后固定不再扫描；
+按 `+` 拆成 4 组，两两解析为 2 轮任务，每轮附 `repeat: 2`；
+关闭二维码摄像头，切换到物块检测 USB 摄像头。
+
+#### ② 首次区域移动
+
+- `skip_grab=false`：发送 `action=1（抓取）`，进入“等待 arrived”；
+- `skip_grab=true`：跳过第 1 轮抓取，直接发送 `action=2（放置）`（单独调放置）；
+- `grab_only=true`：只调抓取，抓完当前轮即退出，不进入放置阶段。
+
+等待期间每帧检查 `arrived` 的 0→1 上升沿；下位机到达指定区域后回 `arrived=1`，
+上位机才进入对应阶段的识别。
+
+#### ③ 抓取阶段（每轮每遍一次）
+
+1. 到达抓取区（`arrived` 0→1）后，打印“第 X 轮第 Y 次抓取顺序: [...]”，重建 `slot_of_color`；
+2. 每帧只检测当前目标颜色（按序列顺序），颜色稳定后发送跟踪指令 `capture=0`；
+3. 位置稳定且 x 偏移 ≤ `grab_center_tolerance_px`（20px）→ 发送 `capture=1`，记录 `last_grabbed_slot`，进入等待；
+4. 未收到 `capture_ack=1` 时每 `capture_resend_interval` 秒重发 `capture=1`；收到 ack 后停止重发；
+5. 下位机执行完回 `finish_capture=1`（0→1 上升沿）：
+   - 上位机立即补发 `capture=0` 包；
+   - 槽位记入 `grabbed_slots`；
+   - 还有颜色没抓 → 重置跟踪状态，继续识别下一个颜色；
+   - 本轮颜色全部抓完 → 发送 `action=2` 前往放置区，等待 `arrived=1`。
+
+#### ④ 放置阶段（每轮每遍一次）
+
+1. 到达放置区（`arrived` 0→1）后，重建 `slot_of_place_digit`、清空 `placed_digits`；
+2. 识别前置条件（两层门）：
+   - 刚放完一个槽位（`place_waiting_arrived=true`）时，必须等到**新的** `arrived` 0→1 才恢复识别；
+   - 最新数据包 `arrived != 1` 时整帧不识别，画面显示 “Waiting for arrived=1 ...”。
+3. 圆环识别：同心圆轮廓分组取最内层，中心裁剪 ROI 后用 MNIST 识别数字；
+   数字必须是 1~3 且置信度 ≥ `min_digit_confidence`（0.8），
+   且不在 `placed_digits` 中、必须在本轮 `slot_of_place_digit` 映射内；
+4. 多个候选取离图像中心最近的一个；**位置连续稳定 N 帧**
+   （`placement.place_stable_threshold`，默认 30 帧，相邻帧圆心位移
+   `< placement.place_stable_max_pixel_move`，默认 20px）
+   且 x 偏移 ≤ 5px 时发送 `capture=1`，记录 `last_placed_digit`，进入等待；
+5. 收到 `finish_capture=1`（0→1 上升沿）：
+   - 立即补发 `capture=0` 包；
+   - 数字加入 `placed_digits`；
+   - 没放满三个 → `place_waiting_arrived=true`，等下一个 `arrived=1` 再识别下一个圆环；
+   - 放满三个 → 进入托盘阶段或轮次重复逻辑。
+
+#### ⑤ 托盘阶段（每轮除最后一次放置外）
+
+1. 放置完一轮 3 个后，若这不是本轮最后一次放置（`tray_phase_skip_last_of_round=true` 时），
+   上位机进入托盘阶段：托盘队列按 `placement.tray_phase_order` 生成，
+   `reverse`=倒序（默认），例如实际顺序 `2,1,3` → `[3,1,2]`；
+   `actual`=按实际放置顺序，例如 `2,1,3` → `[2,1,3]`；
+2. 每个托盘按“放置槽位映射”反推出该托盘上的物块颜色，然后复用抓取阶段的
+   视觉跟踪逻辑：颜色稳定后跟踪（`capture=0`），位置连续稳定 N 帧且
+   x 偏移 ≤ `grab_center_tolerance_px` 才发 `capture=1`，夹爪像第一次抓取一样动态调整；
+3. 每次收到 `finish_capture=1` 后补发 `capture=0`，等下一次 `arrived` 0→1
+   再开始下一个托盘；
+4. 最后一个托盘抓完后，下位机再发 `arrived` 时不再夹起，
+   直接进入下一遍/下一轮（`advance_after_placement_cycle`）。
+
+#### ⑥ 轮次重复与收尾
+
+- 本轮第 1 遍放完（3 个）：先执行托盘阶段，完成后 `round_cycles_done` 加 1，
+  清空 `placed_digits`，发送 `action=1` 回抓取区，等 `arrived=1` 后重复抓同一轮；
+- 本轮第 2 遍（最后一次）放完：**不执行托盘阶段**（不需要夹起），直接进入下一轮，
+  `current_round` 加 1、`round_cycles_done` 清零、
+  `target_colors` 换成下一轮抓取序列，发送 `action=1`，等 `arrived=1`；
+- 两轮全部完成 → 打印“所有轮次完成，退出”，退出主循环并释放资源
+  （摄像头、串口接收线程、串口）。
+
+#### ⑦ 下位机信号约定
+
+| 信号 | 约定 |
+|---|---|
+| `arrived` | 0→1 上升沿表示“已到达指定区域/下一放置位置”；下位机开始移动时必须拉回 0，否则无法产生新的上升沿 |
+| `capture_ack` | 收到 `capture=1` 后回 1，表示正在执行 |
+| `finish_capture` | 动作执行完回 1（0→1 触发上位机切换），之后上位机补发 `capture=0`；下位机完成后应拉回 0，供下一次上升沿使用 |
 
 ### 代码流程图
 
 ```mermaid
 flowchart TD
     START["程序启动"] --> QR["USB 扫描二维码"]
-    QR --> R1G["第1轮抓取：按第1组颜色顺序抓完"]
-    R1G --> R1M["下位机移动到放置区"]
-    R1M --> R1P["第1轮放置：识别圆环数字，逐位放置"]
-    R1P --> R2M["下位机移动到抓取区"]
-    R2M --> R2G["第2轮抓取：按第3组颜色顺序抓完"]
-    R2G --> R2M2["下位机移动到放置区"]
-    R2M2 --> R2P["第2轮放置：识别圆环数字，逐位放置"]
-    R2P --> DONE["全部完成，退出"]
+    QR --> PARSE["解析：2 轮 × 每轮重复 2 次"]
+    PARSE --> SKIP{"skip_grab?"}
+    SKIP -- "是（调试）" --> GO_PLACE1["发 action=2，等 arrived=1"]
+    SKIP -- "否" --> GO_GRAB1["发 action=1，等 arrived=1"]
+    GO_GRAB1 --> GRAB1["第1轮第1次抓取：第1组颜色"]
+    GRAB1 --> GO_PLACE["发 action=2，等 arrived=1"]
+    GO_PLACE --> PLACE1["第1轮第1次放置：第2组数字"]
+    GO_PLACE1 --> PLACE1
+    PLACE1 --> REP1{"第1轮已重复 2 次？"}
+    REP1 -- "否" --> GO_GRAB1
+    REP1 -- "是" --> GO_GRAB2["发 action=1，等 arrived=1"]
+    GO_GRAB2 --> GRAB2["第2轮第1次抓取：第3组颜色"]
+    GRAB2 --> GO_PLACE2["发 action=2，等 arrived=1"]
+    GO_PLACE2 --> PLACE2["第2轮第1次放置：第4组数字"]
+    PLACE2 --> REP2{"第2轮已重复 2 次？"}
+    REP2 -- "否" --> GO_GRAB2
+    REP2 -- "是" --> DONE["全部完成，退出"]
 ```
 
 > 串口发送由独立后台线程 `Sending2Gimbal` 完成：主循环把 `VisionToGimbal` 数据包放入队列，
@@ -124,7 +214,10 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 |---|---|---|
 | `control.mode` | `"manual"` | 切换模式：manual=手动（按 n/空格）；其他值=自动 |
 | `control.auto_switch_timeout` | `10.0` | 非 manual 模式等待 `finish_capture` 的超时兜底切换（秒） |
-| `control.center_tolerance_px` | `5` | x 轴（左右）对准容差（px）：\|目标x - 图像中心x\| ≤ 该值即请求抓取/放置 |
+| `control.skip_grab` | `false` | `true` 时扫描二维码后跳过抓取，直接前往放置区（物块已就位、单独调放置） |
+| `control.grab_only` | `false` | `true` 时扫描二维码后只调试抓取：抓完当前轮即退出，跳过放置阶段 |
+| `control.grab_center_tolerance_px` | `20` | 抓取阶段 x 轴（左右）对准容差（px）：\|目标x - 图像中心x\| ≤ 该值即请求抓取 |
+| `control.place_center_tolerance_px` | `5` | 放置阶段 x 轴（左右）对准容差（px）：\|目标x - 图像中心x\| ≤ 该值即请求放置 |
 | `tracking.capture_resend_interval` | `1.0` | 未收到 `capture_ack` 时重发 `capture=1` 的间隔（秒） |
 | `tracking.send_interval` | `0.1` | 普通跟踪/对准指令（capture=0）的最小发送间隔（秒）；capture=1 与阶段切换等事件包立即发送 |
 | `tracking.chassis_p_gain` | `0.9` | 底盘比例增益：目标偏移 × 该系数后再下发，越靠近移动量越小，避免 0 附近过冲摆动 |
@@ -203,6 +296,36 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 性能说明：调用 `detect(frame, target_code=...)` 时只构建目标颜色的 HSV 掩膜
 （普通颜色 1 次 `inRange`，红色双区间 2 次），不再每帧构建 6 色掩膜；
 主程序抓取阶段严格按序列逐色检测，减少计算量、提升处理帧率。
+
+#### placement.py —— 放置识别参数
+
+放置区圆环/数字识别参数统一放在 [config.yaml](config.yaml) 的 `placement:` 段，
+修改后重启生效：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `placement.model_path` | `/home/xu/Engineer/tiny_digit_cnn.pth` | 数字识别模型路径 |
+| `placement.gripper_fixed` | `min` | 放置时夹爪固定策略：`min`=固定最短（0mm 伸长）只调底盘；`max`=固定最长（84mm 伸长）只调底盘；`dynamic`=与抓取一样动态调夹爪（旧配置 `gripper_fixed_max` 仍兼容） |
+| `placement.gripper_fixed_mm` | `null` | 自定义固定伸长量（mm），非空时优先生效；例如 `40`=固定伸长 40mm 只调底盘 |
+| `placement.debug` | `false` | `true` 时打印圆环/数字识别调试日志（约 1 秒 1 条） |
+| `placement.show_debug` | `false` | `true` 时弹窗显示二值化 / 闭运算 / 圆环 / 数字裁剪的处理过程 |
+| `placement.digit_crop_ratio` | `0.7` | 最内层圆环内数字裁剪比例（相对半径） |
+| `placement.min_ring_radius` | `10` | 圆环最小半径（px） |
+| `placement.min_ring_area` | `300` | 圆环最小面积（px²） |
+| `placement.ring_circularity` | `0.6` | 圆环圆度下限（4πA/P²） |
+| `placement.min_digit_confidence` | `0.8` | 数字识别最低置信度 |
+| `placement.ring_group_overlap` | `0.8` | 同心圆分组判定系数 |
+| `placement.morph_kernel_size` | `5` | 二值化后闭运算核大小 |
+| `placement.min_crop_px` | `12` | 数字裁剪最小半径（px） |
+| `placement.place_stable_threshold` | `30` | 放置阶段位置连续稳定帧数 |
+| `placement.place_stable_max_pixel_move` | `20` | 放置阶段相邻帧圆心最大位移（px） |
+| `placement.record_placement_order` | `true` | `true` 时把每次实际放置的圆环数字按先后顺序追加写入 `placement_order.log`，并在每轮完成后追加“托盘阶段抓取顺序”（数字即托盘号） |
+| `placement.placement_order_log` | `./placement_order.log` | 放置顺序记录文件路径（追加写入，含时间戳） |
+| `placement.tray_phase_enabled` | `true` | `true` 时放置完成后进入托盘阶段（抓取托盘上的物块） |
+| `placement.tray_phase_order` | `reverse` | 托盘阶段抓取顺序：`reverse`=倒序（默认），`actual`=按实际放置顺序 |
+| `placement.tray_phase_action` | `1` | 托盘阶段动作码（默认 1=抓取），保留兼容 |
+| `placement.tray_phase_capture` | `true` | 已由视觉跟踪取代：托盘阶段 capture 由位置稳定+对准决定 |
+| `placement.tray_phase_skip_last_of_round` | `true` | `true` 时每轮最后一次放置不需要夹起，直接进入下一轮 |
 
 #### gimbal.py —— 串口参数
 

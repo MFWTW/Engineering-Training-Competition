@@ -4,6 +4,7 @@ import threading
 import time
 import queue
 from collections import deque
+from pathlib import Path
 from common_camera import (
     open_camera,
     QR_CAMERA_SOURCE,
@@ -61,8 +62,25 @@ ONE_EURO_DT_MAX = float(_cfg("one_euro", "dt_max_s", default=0.2))
 # 非 manual 模式在 auto_switch_timeout 秒内未收到 finish_capture 时超时兜底切换。
 CONTROL_MODE = str(_cfg("control", "mode", default="manual"))
 AUTO_SWITCH_TIMEOUT = float(_cfg("control", "auto_switch_timeout", default=10.0))
-# 图像中心 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求抓取/放置
-CENTER_TOLERANCE = float(_cfg("control", "center_tolerance_px", default=5))
+# true=扫描二维码后跳过抓取，直接前往放置区（用于物块已就位、单独调试放置）
+SKIP_GRAB = bool(_cfg("control", "skip_grab", default=False))
+# true=扫码后只调试抓取：抓完当前轮即退出，跳过放置阶段
+GRAB_ONLY = bool(_cfg("control", "grab_only", default=False))
+# 抓取/放置阶段各自独立的 x 轴（左右）对准容差（px）：
+# |目标x - 图像中心x| ≤ 对应容差才请求抓取/放置。
+# 新键 grab_center_tolerance_px / place_center_tolerance_px 优先；
+# 未配置时兼容旧的 center_tolerance_px（两个阶段都使用该值）。
+_legacy_center_tol = _cfg("control", "center_tolerance_px", default=None)
+_grab_center_tol = _cfg("control", "grab_center_tolerance_px", default=None)
+_place_center_tol = _cfg("control", "place_center_tolerance_px", default=None)
+GRAB_CENTER_TOLERANCE_PX = float(
+    _grab_center_tol if _grab_center_tol is not None
+    else (_legacy_center_tol if _legacy_center_tol is not None else 20)
+)
+PLACE_CENTER_TOLERANCE_PX = float(
+    _place_center_tol if _place_center_tol is not None
+    else (_legacy_center_tol if _legacy_center_tol is not None else 5)
+)
 
 # ==================== 指令发送节流/死区/心跳（config.yaml → tracking） ====================
 # 等待抓取时，若下位机未回传 capture_ack=1，每隔该秒数重发一次 capture=1
@@ -78,6 +96,13 @@ CHASSIS_P_GAIN = float(_cfg("tracking", "chassis_p_gain", default=0.5))
 CHASSIS_SEND_DEADBAND_MM = float(_cfg("tracking", "chassis_send_deadband_mm", default=1.0))
 # 夹爪指令死区（mm）
 GRIPPER_DEADBAND_MM = float(_cfg("tracking", "gripper_deadband_mm", default=5))
+# 夹爪比例增益：夹爪指令本质是“上次指令 + 本次测距”的增量式控制，
+# 直接全量累加会因执行滞后/测量抖动而积分冲顶、来回震荡；
+# 该系数只把测距差值按比例修正（0.5=每帧修正一半），配合限幅后稳定收敛。
+GRIPPER_P_GAIN = float(_cfg("tracking", "gripper_gain", default=0.5))
+# 夹爪指令每个发送周期的变化量上限（mm，按 send_interval 标定），
+# 防止 0→84mm 这种一次顶满的积分冲程。
+GRIPPER_RAMP_STEP_MM = float(_cfg("tracking", "gripper_ramp_step_mm", default=5.0))
 # 平滑跟踪：底盘指令每个发送周期的变化量上限（mm，按 send_interval 标定）。
 # 让指令从小步连续爬升/衰减，而不是 0→30mm→0 这样跳变，避免“动一下停一下”。
 CHASSIS_RAMP_STEP_MM = float(_cfg("tracking", "chassis_ramp_step_mm", default=4.0))
@@ -105,6 +130,16 @@ COLOR_LABEL_EN = {
     "yellow": "YELLOW",
 }
 
+# 画圆/标签用 BGR 颜色（OpenCV 为 BGR 顺序），按颜色名对应 config.yaml 的 code
+COLOR_BGR = {
+    "red": (0, 0, 255),
+    "green": (0, 255, 0),
+    "blue": (255, 0, 0),
+    "light_blue": (255, 255, 0),
+    "black": (0, 0, 0),
+    "yellow": (0, 255, 255),
+}
+
 # ==================== 串口协议动作码（config.yaml → protocol） ====================
 # action 字段：0=启动/空闲，1=抓取模式，2=放置模式
 # （与下位机协议约定，一般不要改）
@@ -119,6 +154,93 @@ MAX_GRIPPER_MM = float(_cfg("safety", "max_gripper_mm", default=400))
 # 普通跟踪包单次允许下发的底盘移动量上限（mm）。限制为小步后，
 # 车会逐次逼近而不是一次发全量偏移大幅来回甩。
 MAX_CHASSIS_STEP_MM = float(_cfg("safety", "max_chassis_step_mm", default=50))
+
+# ==================== 放置阶段夹爪策略（config.yaml → placement） ====================
+# gripper_fixed: min=固定最短(0mm伸长)只调底盘；max=固定最长(84mm伸长)只调底盘；
+#                dynamic=与抓取一样动态调夹爪；旧配置 gripper_fixed_max 仍兼容
+# gripper_fixed_mm: 自定义固定伸长量（mm），非空时优先生效，例如 40=固定伸长40mm只调底盘
+PLACE_GRIPPER_FIXED = str(
+    _cfg("placement", "gripper_fixed", default=None) or (
+        "max" if bool(_cfg("placement", "gripper_fixed_max", default=True)) else "dynamic"
+    )
+).strip().lower()
+PLACE_GRIPPER_FIXED_MAX = PLACE_GRIPPER_FIXED == "max"
+PLACE_GRIPPER_FIXED_MIN = PLACE_GRIPPER_FIXED == "min"
+_place_fixed_mm_cfg = _cfg("placement", "gripper_fixed_mm", default=None)
+PLACE_GRIPPER_FIXED_CUSTOM = _place_fixed_mm_cfg is not None
+if PLACE_GRIPPER_FIXED_CUSTOM:
+    PLACE_GRIPPER_EXTEND_MM = int(round(float(_place_fixed_mm_cfg)))
+    PLACE_GRIPPER_EXTEND_MM = min(
+        max(PLACE_GRIPPER_EXTEND_MM, 0), transformer.MAX_GRIPPER_EXTEND_MM
+    )
+    PLACE_GRIPPER_EXTEND_CM = PLACE_GRIPPER_EXTEND_MM / 10.0
+    PLACE_GRIPPER_MM = PLACE_GRIPPER_EXTEND_MM
+else:
+    PLACE_GRIPPER_EXTEND_CM = (
+        0.0 if PLACE_GRIPPER_FIXED_MIN else transformer.MAX_GRIPPER_EXTEND_CM
+    )
+    PLACE_GRIPPER_MM = (
+        0 if PLACE_GRIPPER_FIXED_MIN else transformer.MAX_GRIPPER_EXTEND_MM
+    )
+
+# ==================== 放置顺序记录（config.yaml → placement） ====================
+# true=把每次实际放置的圆环数字按时间顺序追加写入文本文件，
+# 同时每轮每遍完成时写一条“期望顺序 vs 实际顺序”汇总。
+RECORD_PLACEMENT_ORDER = bool(_cfg("placement", "record_placement_order", default=True))
+PLACEMENT_ORDER_LOG = str(_cfg(
+    "placement", "placement_order_log",
+    default=str(Path(__file__).resolve().parent / "placement_order.log"),
+))
+
+# 放置阶段位置稳定条件（config.yaml → placement）
+PLACE_STABLE_THRESHOLD = int(_cfg("placement", "place_stable_threshold", default=30))
+PLACE_STABLE_MAX_MOVE = float(_cfg("placement", "place_stable_max_pixel_move", default=20.0))
+
+# ==================== 托盘阶段（config.yaml → placement） ====================
+# 放置完成后进入托盘阶段：复用抓取阶段的视觉跟踪逻辑；
+# 抓取顺序由 tray_phase_order 决定：actual=按实际放置顺序，reverse=倒序。
+TRAY_PHASE_ENABLED = bool(_cfg("placement", "tray_phase_enabled", default=True))
+TRAY_PHASE_ORDER = str(_cfg("placement", "tray_phase_order", default="reverse")).strip().lower()
+TRAY_PHASE_ACTION = int(_cfg("placement", "tray_phase_action", default=GRAB_ACTION))
+TRAY_PHASE_CAPTURE = bool(_cfg("placement", "tray_phase_capture", default=True))
+TRAY_PHASE_SKIP_LAST_OF_ROUND = bool(
+    _cfg("placement", "tray_phase_skip_last_of_round", default=True)
+)
+# 托盘阶段夹爪策略（config.yaml → placement.tray_gripper_fixed）：
+# dynamic/null=动态调夹爪；min/max/数字mm=固定夹爪长度，只靠底盘对准。
+# 相机装在夹爪上，机构响应慢时动态夹爪的“测量→指令”闭环会震荡，
+# 固定夹爪后底盘有回传反馈能收敛，彻底绕开这个环。
+_tray_gripper_fixed_cfg = _cfg("placement", "tray_gripper_fixed", default=None)
+TRAY_GRIPPER_FIXED = (
+    str(_tray_gripper_fixed_cfg).strip().lower()
+    if _tray_gripper_fixed_cfg is not None else "dynamic"
+)
+TRAY_GRIPPER_FIXED_MIN = TRAY_GRIPPER_FIXED == "min"
+TRAY_GRIPPER_FIXED_MAX = TRAY_GRIPPER_FIXED == "max"
+_tray_fixed_mm_cfg = None
+try:
+    _tray_fixed_mm_cfg = float(_tray_gripper_fixed_cfg)
+except (TypeError, ValueError):
+    pass
+TRAY_GRIPPER_FIXED_CUSTOM = (
+    _tray_fixed_mm_cfg is not None
+    and not TRAY_GRIPPER_FIXED_MIN
+    and not TRAY_GRIPPER_FIXED_MAX
+)
+if TRAY_GRIPPER_FIXED_CUSTOM:
+    TRAY_GRIPPER_EXTEND_MM = int(round(_tray_fixed_mm_cfg))
+    TRAY_GRIPPER_EXTEND_MM = min(
+        max(TRAY_GRIPPER_EXTEND_MM, 0), transformer.MAX_GRIPPER_EXTEND_MM
+    )
+    TRAY_GRIPPER_EXTEND_CM = TRAY_GRIPPER_EXTEND_MM / 10.0
+    TRAY_GRIPPER_MM = TRAY_GRIPPER_EXTEND_MM
+else:
+    TRAY_GRIPPER_EXTEND_CM = (
+        0.0 if TRAY_GRIPPER_FIXED_MIN else transformer.MAX_GRIPPER_EXTEND_CM
+    )
+    TRAY_GRIPPER_MM = (
+        0 if TRAY_GRIPPER_FIXED_MIN else transformer.MAX_GRIPPER_EXTEND_MM
+    )
 
 # ==================== 日志打印节流（config.yaml → logging） ====================
 # 指令打印节流：数值变化或超过该间隔才打印一次，避免每帧刷屏
@@ -347,6 +469,35 @@ def log_command(tag, target, action, capture,
         )
 
 
+def append_placement_record(text):
+    """把一行放置记录追加到 PLACEMENT_ORDER_LOG（失败只告警，不影响主流程）。"""
+    if not RECORD_PLACEMENT_ORDER:
+        return
+    try:
+        with open(PLACEMENT_ORDER_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+    except OSError as exc:
+        print(f"[放置记录] 写入失败: {PLACEMENT_ORDER_LOG}: {exc}")
+
+
+def log_tray_order(round_no, cycle_no, placed_order, order_mode="actual"):
+    """按配置的顺序模式生成“托盘阶段”抓取顺序并记录（数字即托盘号）。"""
+    if not placed_order:
+        return
+    if order_mode in ("reverse", "reversed", "倒序"):
+        seq = list(reversed(placed_order))
+        label = "倒序"
+    else:
+        seq = list(placed_order)
+        label = "实际顺序"
+    line = (
+        f"第{round_no}轮 第{cycle_no}遍 托盘阶段：{label}抓取="
+        f"{','.join(map(str, seq))}，对应托盘={','.join(map(str, seq))}"
+    )
+    print(f"[托盘顺序] {line}")
+    append_placement_record(line)
+
+
 # ==================== 发送线程 ====================
 def Sending2Gimbal(data_pack, serial_comm):
     """后台常驻：阻塞等待队列数据，收到就打包发送"""
@@ -464,14 +615,25 @@ def main():
     all_done = False            # 所有目标已完成，退出主循环
     rounds = []                 # [{"grab": [...], "place": [...]}, ...]
     current_round = 0
+    round_cycles_done = 0       # 当前轮已完成几遍“抓取→放置”（0 开始，每轮 repeat 次）
     phase = IDLE_ACTION         # 当前动作：0=启动/空闲，1=抓取，2=放置
     phase_after_arrival = IDLE_ACTION
     waiting_for_arrive = False  # 正在等待下位机到达指定区域
+    place_waiting_arrived = False  # 放置完一个槽位后，等待下位机到达下一位置（新的 arrived=1）
     prev_arrived = 0
     recognition_started = False  # 是否已打印当前阶段“开始识别”提示
     placed_digits = set()       # 本轮已放置的圆环数字
+    placed_order = []           # 本轮实际放置的圆环数字（按放置先后顺序）
     last_placed_digit = None
+    tray_phase_active = False   # 是否处于托盘阶段（按配置顺序抓取托盘上的物块）
+    tray_targets = []           # 托盘阶段剩余待发送 target（按 tray_phase_order 配置生成）
+    tray_plan = []              # 托盘阶段剩余 [(托盘号, 物块颜色), ...]，进入阶段时一次算好
+    tray_pending_digit = None   # 托盘阶段当前正在抓取的 target（已到达托盘，等待抓取完成）
+    place_stable_count = 0      # 放置阶段位置稳定计数（连续同圆环且位移小）
+    place_last_center = None    # 放置阶段上一帧选中圆环中心
+    place_last_digit = None     # 放置阶段上一帧选中圆环数字
     placement_recognizer = None
+    last_place_dbg = 0.0          # 放置发送调试日志节流
     target_colors = []          # 当前轮抓取颜色序列（rounds[current_round]["grab"] 的别名）
     target_index = 0
     last_detection_time = None
@@ -533,6 +695,7 @@ def main():
         nonlocal last_smooth_cmd_mm, last_smooth_time
         nonlocal last_valid_mm, last_detected_center, last_detection_time, last_kf_time
         nonlocal recognition_started
+        nonlocal place_stable_count, place_last_center, place_last_digit
         detection_sent = False
         waiting_for_next = False
         sent_time = None
@@ -548,14 +711,87 @@ def main():
         last_detected_center = None
         last_detection_time = None
         recognition_started = False
+        place_stable_count = 0
+        place_last_center = None
+        place_last_digit = None
         detector.reset()
         kf.reset()
         one_euro_tracker.reset()
 
+    def advance_after_placement_cycle():
+        """一轮（一遍）放置完成后：未重复完则回抓取区，重复完则进下一轮或结束。
+
+        返回 "done" 表示所有轮次完成，否则已发出前往抓取区的指令。
+        """
+        nonlocal round_cycles_done, current_round, target_colors, target_index
+        nonlocal placed_digits, placed_order, place_waiting_arrived
+        nonlocal waiting_for_arrive, phase_after_arrival, prev_arrived
+        nonlocal placed_block_slots
+
+        repeat = rounds[current_round].get("repeat", 1)
+        if round_cycles_done + 1 < repeat:
+            round_cycles_done += 1
+            append_placement_record(
+                f"第{current_round + 1}轮 第{round_cycles_done}遍 完成 "
+                f"期望顺序={','.join(rounds[current_round]['place'])} "
+                f"实际顺序={','.join(map(str, placed_order))}"
+            )
+            target_colors = rounds[current_round]["grab"]
+            target_index = 0
+            placed_digits = set()
+            placed_order = []
+            # 新一遍回抓取区时物块重新立放（14.3cm）：
+            # 清掉上一遍放置留下的躺倒标记，让第二次抓取与第一次用同一套跟踪策略；
+            # 托盘阶段的躺倒高度由 tray_phase_active 单独判断。
+            placed_block_slots.clear()
+            place_waiting_arrived = False
+            print(f"第 {current_round + 1} 轮第 {round_cycles_done} 次"
+                  f"放置完成，回抓取区进行第 {round_cycles_done + 1} 次抓取")
+            vg = VisionToGimbal(target=0, action=GRAB_ACTION)
+            enqueue_latest(q, vg)
+            waiting_for_arrive = True
+            phase_after_arrival = GRAB_ACTION
+            prev_arrived = 0
+            reset_action_state()
+            return "grab"
+
+        if current_round + 1 < len(rounds):
+            append_placement_record(
+                f"第{current_round + 1}轮 第{round_cycles_done + 1}遍 完成 "
+                f"期望顺序={','.join(rounds[current_round]['place'])} "
+                f"实际顺序={','.join(map(str, placed_order))}"
+            )
+            current_round += 1
+            round_cycles_done = 0
+            target_colors = rounds[current_round]["grab"]
+            target_index = 0
+            placed_digits = set()
+            placed_order = []
+            placed_block_slots.clear()
+            place_waiting_arrived = False
+            print(f"第 {current_round} 轮放置完成（共 {repeat} 次），"
+                  f"前往第 {current_round + 1} 轮抓取区")
+            vg = VisionToGimbal(target=0, action=GRAB_ACTION)
+            enqueue_latest(q, vg)
+            waiting_for_arrive = True
+            phase_after_arrival = GRAB_ACTION
+            prev_arrived = 0
+            reset_action_state()
+            return "grab"
+
+        append_placement_record(
+            f"第{current_round + 1}轮 第{round_cycles_done + 1}遍 完成 "
+            f"期望顺序={','.join(rounds[current_round]['place'])} "
+            f"实际顺序={','.join(map(str, placed_order))} 全部任务完成"
+        )
+        print("所有轮次完成，退出")
+        return "done"
+
     def smooth_tracking_cmd(cmd_mm, now):
         """
         把目标移动量平滑成连续小步：
-        比例缩放 → 单包限幅 → 按 ramp 限制指令每帧变化量。
+        比例缩放 → 单包限幅 → 按 ramp 限制指令每帧变化量；
+        夹爪同样先乘比例增益再按 ramp 限幅，避免增量式指令积分冲顶。
         底盘指令不会从 0 突然跳到几十 mm，也不会在目标附近骤停。
         """
         nonlocal last_smooth_cmd_mm, last_smooth_time
@@ -569,15 +805,22 @@ def main():
         dt = min(max(now - last_smooth_time, 0.0), 0.5)
         if TRACKING_SEND_INTERVAL > 0:
             ramp = CHASSIS_RAMP_STEP_MM * (dt / TRACKING_SEND_INTERVAL)
+            gripper_ramp = GRIPPER_RAMP_STEP_MM * (dt / TRACKING_SEND_INTERVAL)
         else:
             ramp = CHASSIS_RAMP_STEP_MM
+            gripper_ramp = GRIPPER_RAMP_STEP_MM
         ramp = max(ramp, 0.5)
+        gripper_ramp = max(gripper_ramp, 0.5)
 
-        lx, ly, _ = last_smooth_cmd_mm
+        lx, ly, lz = last_smooth_cmd_mm
         nx = lx + max(-ramp, min(ramp, dx - lx))
         ny = ly + max(-ramp, min(ramp, dy - ly))
+        # 夹爪：先比例增益再限幅（只允许向目标方向缓慢修正）
+        gz_delta = int(round((gripper - lz) * GRIPPER_P_GAIN))
+        gz = lz + max(-gripper_ramp, min(gripper_ramp, gz_delta))
+        gz = int(round(min(max(gz, 0), MAX_GRIPPER_MM)))
 
-        last_smooth_cmd_mm = (int(round(nx)), int(round(ny)), gripper)
+        last_smooth_cmd_mm = (int(round(nx)), int(round(ny)), gz)
         last_smooth_time = now
         return last_smooth_cmd_mm
 
@@ -649,19 +892,35 @@ def main():
                         grab = [c for c in groups[i] if c.isdigit()]
                         place = [c for c in groups[i + 1] if c.isdigit()]
                         if grab and place:
-                            rounds.append({"grab": grab, "place": place})
+                            # 每轮“抓取→放置”要重复执行 2 遍（第 1 轮=前两组×2，
+                            # 第 2 轮=后两组×2），显示仍只显示二维码扫到的 4 组
+                            rounds.append({
+                                "grab": grab,
+                                "place": place,
+                                "repeat": 2,
+                            })
                     if not rounds:
                         print("[QR] 无法解析抓取/放置序列，退出")
                         break
 
                     current_round = 0
+                    round_cycles_done = 0
                     target_colors = rounds[0]["grab"]
                     target_index = 0
                     phase = GRAB_ACTION
                     phase_after_arrival = GRAB_ACTION
                     waiting_for_arrive = False
+                    place_waiting_arrived = False
                     placed_digits = set()
+                    placed_order = []
                     last_placed_digit = None
+                    tray_phase_active = False
+                    tray_targets = []
+                    tray_plan = []
+                    tray_pending_digit = None
+                    place_stable_count = 0
+                    place_last_center = None
+                    place_last_digit = None
                     grabbed_slots = set()
                     placed_block_slots = set()   # 已放置过的槽位：再次夹取时物块已躺倒
                     last_grabbed_slot = None
@@ -670,15 +929,27 @@ def main():
                     placement_recognizer = None
 
                     # 协议 B：QR 内容只在上位机使用，下位机只收一个 task 开始信号
-                    vg = VisionToGimbal(target=0, action=GRAB_ACTION)
-                    enqueue_latest(q, vg)
-                    # 等下位机到达抓取区回 arrived=1 后再开始识别物料
-                    waiting_for_arrive = True
-                    phase_after_arrival = GRAB_ACTION
-                    prev_arrived = 0
+                    if SKIP_GRAB and not GRAB_ONLY:
+                        # 物块已就位：跳过抓取，直接前往放置区单独调放置
+                        phase = PLACE_ACTION
+                        vg = VisionToGimbal(target=0, action=PLACE_ACTION)
+                        enqueue_latest(q, vg)
+                        waiting_for_arrive = True
+                        phase_after_arrival = PLACE_ACTION
+                        prev_arrived = 0
+                        print(f"已跳过抓取，放置编号: {rounds[0]['place']}（每轮重复 2 次）")
+                        print("已发送放置区移动指令，等待下位机 arrived=1 后开始识别放置位置")
+                    else:
+                        vg = VisionToGimbal(target=0, action=GRAB_ACTION)
+                        enqueue_latest(q, vg)
+                        # 等下位机到达抓取区回 arrived=1 后再开始识别物料
+                        waiting_for_arrive = True
+                        phase_after_arrival = GRAB_ACTION
+                        prev_arrived = 0
 
-                    print(f"第 1 轮抓取顺序: {target_colors}，放置编号: {rounds[0]['place']}")
-                    print("已发送抓取区移动指令，等待下位机 arrived=1 后开始识别物料")
+                        print(f"第 1 轮抓取顺序: {target_colors}，"
+                              f"放置编号: {rounds[0]['place']}（每轮重复 2 次）")
+                        print("已发送抓取区移动指令，等待下位机 arrived=1 后开始识别物料")
 
                 if last_sessions is not None:
                     if cap:
@@ -765,10 +1036,13 @@ def main():
                     reset_action_state()
                     target_index = 0
                     if phase == PLACE_ACTION:
+                        place_waiting_arrived = False
                         placed_digits = set()
+                        placed_order = []
                         last_placed_digit = None
                         slot_of_place_digit = {
-                            d: i + 1 for i, d in enumerate(rounds[current_round]["place"])
+                            int(d): i + 1
+                            for i, d in enumerate(rounds[current_round]["place"])
                         }
                         if placement_recognizer is None:
                             placement_recognizer = PlacementRecognizer()
@@ -776,12 +1050,47 @@ def main():
                     else:
                         grabbed_slots = set()
                         last_grabbed_slot = None
-                        slot_of_color = {c: i + 1 for i, c in enumerate(target_colors)}
-                        print(f"已到达抓取区，开始识别物料（第 {current_round + 1} 轮抓取顺序: {target_colors}）")
+                        if tray_phase_active and tray_pending_digit is not None:
+                            print(f"[托盘] 已到达托盘 {tray_pending_digit}，开始识别物块")
+                        else:
+                            slot_of_color = {c: i + 1 for i, c in enumerate(target_colors)}
+                            print(f"已到达抓取区，开始识别物料"
+                                  f"（第 {current_round + 1} 轮第 {round_cycles_done + 1} 次"
+                                  f"抓取顺序: {target_colors}）")
                     continue
 
                 # 动作完成（抓取完成 / 放置完成）
                 if finish_rising:
+                    # 动作完成：立即补发 capture=0，通知下位机本次抓取/放置已结束
+                    if tray_phase_active and tray_pending_digit is not None:
+                        release_target = tray_pending_digit
+                        release_action = TRAY_PHASE_ACTION
+                    elif phase == GRAB_ACTION:
+                        release_target = last_grabbed_slot
+                        release_action = GRAB_ACTION
+                    else:
+                        release_target = (
+                            slot_of_place_digit.get(last_placed_digit, 0)
+                            if last_placed_digit is not None else 0
+                        )
+                        release_action = PLACE_ACTION
+                    enqueue_latest(q, VisionToGimbal(
+                        target=release_target if release_target is not None else 0,
+                        action=release_action,
+                        capture=False,
+                    ))
+                    print(f"[动作完成] 已补发 capture=0 "
+                          f"(target={release_target}, action={release_action})")
+
+                    if tray_phase_active and tray_pending_digit is not None:
+                        tray_pending_digit = None
+                        grabbed_slots = set()
+                        last_grabbed_slot = None
+                        reset_action_state()
+                        print("托盘抓取完成，已补发 capture=0，"
+                              "等待下位机前往下一托盘（arrived=1）")
+                        continue
+
                     if phase == GRAB_ACTION:
                         grabbed_new = last_grabbed_slot is not None
                         if last_grabbed_slot is not None:
@@ -790,7 +1099,13 @@ def main():
                             print(f"已抓取放入槽位: {sorted(grabbed_slots)}")
 
                         if len(grabbed_slots) >= len(target_colors):
-                            print("本轮抓取完成，前往放置区...")
+                            if GRAB_ONLY:
+                                print(f"第 {current_round + 1} 轮第 {round_cycles_done + 1} 次"
+                                      f"抓取完成（抓取调试模式），跳过放置并退出")
+                                all_done = True
+                                break
+                            print(f"第 {current_round + 1} 轮第 {round_cycles_done + 1} 次"
+                                  f"抓取完成，前往放置区...")
                             vg = VisionToGimbal(target=0, action=PLACE_ACTION)
                             enqueue_latest(q, vg)
                             waiting_for_arrive = True
@@ -813,34 +1128,158 @@ def main():
                             continue
                     else:
                         if last_placed_digit is not None:
-                            placed_digits.add(last_placed_digit)
-                            placed_block_slots.add(slot_of_place_digit[last_placed_digit])
+                            done_digit = last_placed_digit
+                            placed_digits.add(done_digit)
+                            placed_order.append(done_digit)
+                            placed_block_slots.add(slot_of_place_digit[done_digit])
                             last_placed_digit = None
-                            print(f"已放置数字: {sorted(placed_digits)}")
+                            print(f"已放置数字: {sorted(placed_digits)}，"
+                                  f"实际顺序: {placed_order}")
+                            append_placement_record(
+                                f"第{current_round + 1}轮 第{round_cycles_done + 1}遍 "
+                                f"第{len(placed_order)}个 放置数字{done_digit}"
+                                f"（已放置顺序: {','.join(map(str, placed_order))}）"
+                            )
 
                         if len(placed_digits) >= len(rounds[current_round]["grab"]):
-                            if current_round + 1 < len(rounds):
-                                current_round += 1
-                                target_colors = rounds[current_round]["grab"]
-                                target_index = 0
-                                placed_digits = set()
-                                print(f"第 {current_round + 1} 轮放置完成，前往抓取区")
-                                vg = VisionToGimbal(target=0, action=GRAB_ACTION)
-                                enqueue_latest(q, vg)
-                                waiting_for_arrive = True
-                                phase_after_arrival = GRAB_ACTION
-                                prev_arrived = 0
+                            repeat = rounds[current_round].get("repeat", 1)
+                            is_last_pass = (round_cycles_done + 1 >= repeat)
+                            want_tray_phase = (
+                                TRAY_PHASE_ENABLED
+                                and bool(placed_order)
+                                and not (TRAY_PHASE_SKIP_LAST_OF_ROUND and is_last_pass)
+                            )
+                            if want_tray_phase:
+                                tray_phase_active = True
+                                tray_order_label = (
+                                    "倒序"
+                                    if TRAY_PHASE_ORDER in ("reverse", "reversed", "倒序")
+                                    else "实际顺序"
+                                )
+                                tray_targets = (
+                                    list(reversed(placed_order))
+                                    if TRAY_PHASE_ORDER in ("reverse", "reversed", "倒序")
+                                    else list(placed_order)
+                                )
+                                # 进入阶段时一次算好每个托盘对应的物块颜色，
+                                # 避免后面 slot_of_color 被单托盘映射覆盖后找不到颜色
+                                tray_plan = []
+                                for _tray_digit in tray_targets:
+                                    _place_slot = slot_of_place_digit.get(_tray_digit)
+                                    _tray_color = None
+                                    if _place_slot is not None:
+                                        _tray_color = next(
+                                            (c for c, s in slot_of_color.items()
+                                             if s == _place_slot),
+                                            None,
+                                        )
+                                    if _tray_color is None:
+                                        print(f"[托盘] 托盘{_tray_digit} "
+                                              f"找不到对应物块颜色，跳过")
+                                        continue
+                                    tray_plan.append((_tray_digit, _tray_color))
+                                plan_digits = ",".join(
+                                    str(d) for d, _ in tray_plan
+                                )
+                                plan_colors = ",".join(
+                                    str(c) for _, c in tray_plan
+                                )
+                                print(f"[托盘计划] 第{current_round + 1}轮 "
+                                      f"第{round_cycles_done + 1}遍 {tray_order_label}抓取="
+                                      f"{plan_digits}，对应颜色={plan_colors}")
+                                append_placement_record(
+                                    f"第{current_round + 1}轮 "
+                                    f"第{round_cycles_done + 1}遍 托盘计划："
+                                    f"{tray_order_label}抓取={plan_digits}，"
+                                    f"对应颜色={plan_colors}"
+                                )
+                                log_tray_order(
+                                    current_round + 1,
+                                    round_cycles_done + 1,
+                                    placed_order,
+                                    TRAY_PHASE_ORDER,
+                                )
+                                # 先置 1：等 arrived 掉到 0 再重新上升，
+                                # 避免把放置区旧的 arrived=1 误当成托盘阶段触发
+                                prev_arrived = 1
                                 reset_action_state()
+                                tray_pending_digit = None
+                                print(f"第 {current_round + 1} 轮第 {round_cycles_done + 1} 次"
+                                      f"放置完成，进入托盘阶段（{tray_order_label}抓取）: "
+                                      f"{tray_targets}，"
+                                      f"等待下位机 arrived")
                                 continue
-                            else:
-                                print("所有轮次完成，退出")
+                            result = advance_after_placement_cycle()
+                            if result == "done":
                                 all_done = True
                                 break
+                            continue
                         else:
                             # 还有位置没放完，下位机自己移动到下一个位置
                             reset_action_state()
-                            print("等待识别下一个放置位置...")
+                            place_waiting_arrived = True
+                            print("本槽放置完成，等待下位机到达下一个放置位置（arrived=1）")
                             continue
+
+                # ==================== 托盘阶段（按配置顺序抓取托盘上的物块） ====================
+                # 复用抓取阶段的视觉跟踪逻辑：按托盘对应物块颜色识别、
+                # 动态调夹爪，位置稳定且对准后才发 capture=1。
+                if tray_phase_active:
+                    if arrived_rising:
+                        if tray_pending_digit is not None:
+                            # 上一托盘还没抓完：这个 arrived 上升沿只是干扰，
+                            # 必须直接跳过本帧，否则会掉进下面“所有托盘已抓完”
+                            # 的分支，把托盘阶段提前结束（表现为目标颜色突然跳变）。
+                            continue
+                        elif tray_plan:
+                            tray_digit, tray_color = tray_plan.pop(0)
+                            tray_pending_digit = tray_digit
+                            target_colors = [tray_color]
+                            target_index = 0
+                            slot_of_color = {tray_color: tray_digit}
+                            grabbed_slots = set()
+                            last_grabbed_slot = None
+                            phase = GRAB_ACTION
+                            prev_arrived = 1
+                            reset_action_state()
+                            remaining = [
+                                f"{d}:{c}" for d, c in tray_plan
+                            ]
+                            print(f"[托盘] 当前抓取对象: 托盘{tray_digit}，"
+                                  f"物块颜色={tray_color}，剩余计划: {remaining}")
+                            append_placement_record(
+                                f"第{current_round + 1}轮 "
+                                f"第{round_cycles_done + 1}遍 托盘阶段 "
+                                f"当前抓取对象: 托盘{tray_digit} 颜色={tray_color}"
+                            )
+                            continue
+
+                        # 所有托盘已抓完，收到 arrived 说明最后一个托盘抓取已结束
+                        tray_phase_active = False
+                        tray_targets = []
+                        tray_plan = []
+                        tray_pending_digit = None
+                        print("托盘阶段完成，前往下一遍/下一轮")
+                        result = advance_after_placement_cycle()
+                        # advance_after_placement_cycle 已把 prev_arrived 置 0：
+                        # 这个 arrived=1 就是下位机到达下一区域（抓取区）的信号，
+                        # 不能再吞掉，否则会永远等不到 0→1 上升沿而卡住。
+                        if result == "done":
+                            all_done = True
+                            break
+                        continue
+
+                    if tray_pending_digit is None:
+                        if frame is not None:
+                            cv2.putText(frame, "Tray phase: waiting arrived ...",
+                                        (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                        (0, 255, 255), 2)
+                            show_detection(frame)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
+                        continue
+
+                    # 已到达当前托盘：继续走下方 GRAB_ACTION 视觉跟踪/抓取逻辑
 
                 if frame is not None:
                     h_img, w_img = frame.shape[:2]
@@ -856,8 +1295,8 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                     # 显示 QR 和状态
-                    if scan_QRcode_andlist.session:
-                        qr_text = "+".join(scan_QRcode_andlist.session)
+                    if scan_QRcode_andlist.groups:
+                        qr_text = "+".join(scan_QRcode_andlist.groups)
                         cv2.putText(frame, qr_text, (50, 50),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
@@ -910,17 +1349,85 @@ def main():
                                 break
                             continue
 
+                        # 放置完一个槽位后：先等 finish_capture（上面的 waiting_for_next），
+                        # 再等一次新的 arrived 0→1，才允许识别下一个放置位置
+                        if place_waiting_arrived:
+                            if not arrived_rising:
+                                cv2.putText(frame, "Waiting for arrived=1 ...",
+                                            (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                            (0, 255, 255), 2)
+                                show_detection(frame)
+                                if cv2.waitKey(1) & 0xFF == ord('q'):
+                                    break
+                                continue
+                            place_waiting_arrived = False
+                            print("已到达下一个放置位置，继续识别")
+
+                        # 下位机 arrived=1 时才允许识别/放置，否则不识别
+                        # （下位机移动中 arrived=0，自然停在这里等它到位）
+                        if chassis_data2 is None or chassis_data2.arrived != 1:
+                            cv2.putText(frame, "Waiting for arrived=1 ...",
+                                        (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                        (0, 255, 255), 2)
+                            show_detection(frame)
+                            if cv2.waitKey(1) & 0xFF == ord('q'):
+                                break
+                            continue
+
                         if placement_recognizer is None:
                             placement_recognizer = PlacementRecognizer()
 
-                        results = placement_recognizer.recognize(frame)
+                        expected_order = ",".join(rounds[current_round]["place"])
+                        got_order = ",".join(map(str, placed_order)) if placed_order else "-"
+                        if placed_order:
+                            tray_order = (
+                                ",".join(map(str, reversed(placed_order)))
+                                if TRAY_PHASE_ORDER in ("reverse", "reversed", "倒序")
+                                else ",".join(map(str, placed_order))
+                            )
+                        else:
+                            tray_order = "-"
+                        cv2.putText(frame,
+                                    f"Exp: {expected_order}  Got: {got_order}  Tray: {tray_order}",
+                                    (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                    (0, 255, 255), 2)
+
+                        all_rings = placement_recognizer.recognize_all(frame)
+
+                        # 所有检测到的圆环都画到主画面上，方便看识别情况
+                        for ring in all_rings:
+                            rx, ry = int(ring["center"][0]), int(ring["center"][1])
+                            rr = int(ring["radius"])
+                            cv2.circle(frame, (rx, ry), rr, (0, 255, 0), 2)
+                            cv2.circle(frame, (rx, ry), 3, (0, 255, 0), -1)
+                            label = str(ring["digit"]) if ring["digit"] is not None else "?"
+                            conf_txt = (f"{ring['confidence']:.2f}"
+                                        if ring["digit"] is not None else "")
+                            cv2.putText(frame, f"{label} {conf_txt}",
+                                        (rx - 30, ry - rr - 8),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                        (0, 255, 0), 1)
+
                         candidates = [
-                            r for r in results
-                            if r["digit"] not in placed_digits
+                            r for r in all_rings
+                            if r["digit"] is not None
+                            and r["digit"] not in placed_digits
                             and r["digit"] in slot_of_place_digit
                         ]
 
                         if not candidates:
+                            now = time.time()
+                            if all_rings and now - last_place_dbg >= 1.0:
+                                last_place_dbg = now
+                                digits_seen = sorted(
+                                    {r["digit"] for r in all_rings
+                                     if r["digit"] is not None}
+                                )
+                                print(
+                                    f"[放置] 识别到数字 {digits_seen}，"
+                                    f"槽位映射={slot_of_place_digit}，"
+                                    f"已放={sorted(placed_digits)}，无候选，未发送"
+                                )
                             cv2.putText(frame, "Looking for ring digit...",
                                         (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                         (0, 0, 255), 2)
@@ -946,31 +1453,83 @@ def main():
                                    (255, 0, 255), 2)
                         cv2.circle(frame, (ring_cx, ring_cy), 4, (255, 0, 255), -1)
                         cv2.putText(frame, f"digit={digit} conf={target['confidence']:.2f}",
-                                    (ring_cx - 60, ring_cy - target['radius'] - 10),
+                                    (ring_cx - 60,
+                                     int(ring_cy - target['radius'] - 10)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+
+                        # 位置连续稳定 N 帧才允许放置（参数在 config.yaml → placement）
+                        place_stable_threshold = PLACE_STABLE_THRESHOLD
+                        place_move_max = PLACE_STABLE_MAX_MOVE
+                        if place_last_center is None or place_last_digit != digit:
+                            place_stable_count = 1
+                        else:
+                            move_px = np.hypot(
+                                ring_cx - place_last_center[0],
+                                ring_cy - place_last_center[1],
+                            )
+                            place_stable_count = (
+                                place_stable_count + 1 if move_px < place_move_max else 1
+                            )
+                        place_last_center = (float(ring_cx), float(ring_cy))
+                        place_last_digit = digit
+                        position_stable = (
+                            place_stable_count >= place_stable_threshold
+                        )
 
                         # 只比较 x 轴（左右）偏差；y 轴对应前后距离，
                         # 由底盘 y / 夹爪伸长量按 mm 死区闭环，不作为图像对准判据
                         cur_offset = abs(ring_cx - w_img // 2)
-                        capture = cur_offset <= CENTER_TOLERANCE
+                        capture = (
+                            position_stable
+                            and cur_offset <= PLACE_CENTER_TOLERANCE_PX
+                        )
+                        cv2.putText(
+                            frame,
+                            f"place stable: {place_stable_count}/{place_stable_threshold}",
+                            (50, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 255, 100), 1,
+                        )
 
                         coord = None
                         if transformer.CAMERA_FOCAL_PX_X is not None:
+                            if PLACE_GRIPPER_FIXED_CUSTOM:
+                                place_gripper_extend_cm = PLACE_GRIPPER_EXTEND_CM
+                                place_fixed_gripper_cm = (
+                                    transformer.min_jar_dis[1] + place_gripper_extend_cm
+                                )
+                            elif PLACE_GRIPPER_FIXED_MAX:
+                                place_gripper_extend_cm = PLACE_GRIPPER_EXTEND_CM
+                                place_fixed_gripper_cm = transformer.max_jar_dis[1]
+                            elif PLACE_GRIPPER_FIXED_MIN:
+                                place_gripper_extend_cm = 0.0
+                                place_fixed_gripper_cm = transformer.min_jar_dis[1]
+                            else:
+                                place_gripper_extend_cm = current_gripper_cm
+                                place_fixed_gripper_cm = None
                             coord = transformer.pixel_to_camera(
                                 ring_cx, ring_cy,
                                 image_width=w_img,
                                 image_height=h_img,
                                 block_height_cm=0.0,   # 放置区对准的是地面圆环
-                                gripper_extension_cm=current_gripper_cm,
+                                gripper_extension_cm=place_gripper_extend_cm,
                             )
 
                         if coord is not None:
                             cmd_mm = transformer.command_to_protocol_mm(
-                                coord, gripper_extension_cm=current_gripper_cm
+                                coord,
+                                gripper_extension_cm=place_gripper_extend_cm,
+                                fixed_gripper_cm=place_fixed_gripper_cm,
                             )
                             if cmd_mm == (0, 0, 0):
                                 warn_zero_command("放置", coord, ring_cx, ring_cy)
                             chassis_x_mm, chassis_y_mm, gripper_mm = cmd_mm
+                            if (
+                                PLACE_GRIPPER_FIXED_CUSTOM
+                                or PLACE_GRIPPER_FIXED_MAX
+                                or PLACE_GRIPPER_FIXED_MIN
+                            ):
+                                # 放置时夹爪固定（min/max/自定义 mm）：只调底盘
+                                gripper_mm = PLACE_GRIPPER_MM
                             chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
                                 (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
                             )
@@ -994,7 +1553,8 @@ def main():
                             chassis_y_mm=chassis_y_mm,
                             gripper_mm=gripper_mm,
                         )
-                        if tracking_send_allowed(capture, desired_mm):
+                        sent = tracking_send_allowed(capture, desired_mm)
+                        if sent:
                             enqueue_latest(q, vg)
                             log_command(
                                 "放置", slot_index, PLACE_ACTION, capture,
@@ -1003,6 +1563,16 @@ def main():
                                 camera_coord=coord,
                                 world_coord=transformer.camera_to_world(coord),
                             )
+                        else:
+                            now = time.time()
+                            if now - last_place_dbg >= 1.0:
+                                last_place_dbg = now
+                                print(
+                                    f"[放置] 识别到了但未发送: capture={capture} "
+                                    f"cmd={desired_mm} 上次发送={last_sent_tracking_mm} "
+                                    f"距上次发送={now - last_tracking_send:.2f}s "
+                                    f"x偏移={cur_offset}px"
+                                )
 
                         if capture and last_placed_digit is None:
                             last_placed_digit = digit
@@ -1062,10 +1632,14 @@ def main():
                     # ---- 正常检测模式 ----
                     if not recognition_started:
                         recognition_started = True
-                        print(
-                            "[识别] 开始抓取区识别"
-                            f"（等待 arrived: {'是' if waiting_for_arrive else '否'}）"
-                        )
+                        if tray_phase_active and tray_pending_digit is not None:
+                            print(f"[托盘] 开始识别托盘{tray_pending_digit}物块"
+                                  f"（目标颜色={target_colors[target_index]}）")
+                        else:
+                            print(
+                                "[识别] 开始抓取区识别"
+                                f"（等待 arrived: {'是' if waiting_for_arrive else '否'}）"
+                            )
                     current_time = cv2.getTickCount()
                     # 按 QR 顺序只检测当前目标颜色，避免每帧构建 6 种颜色掩膜
                     current_target_code = target_colors[target_index]
@@ -1118,12 +1692,8 @@ def main():
                             fvx = fvy = fax = fay = 0.0
 
                         # 可视化
-                        color_map = {
-                            "1": (0, 0, 255), "2": (0, 255, 0),
-                            "3": (255, 0, 0), "4": (255, 255, 0),
-                            "5": (0, 0, 0), "6": (0, 255, 255),
-                        }
-                        draw_color = color_map.get(current_color, (255, 255, 255))
+                        color_key = CODE_TO_KEY.get(current_color)
+                        draw_color = COLOR_BGR.get(color_key, (255, 255, 255))
                         radius = detector.last_radius
                         viz = KALMAN_CFG["visualize"]
                         viz_on = viz["enabled"]
@@ -1139,8 +1709,9 @@ def main():
                             cv2.circle(frame, filtered_center, radius, draw_color, 2)
                             cv2.circle(frame, filtered_center, 4, draw_color, -1)
 
-                        label = {"1": "RED", "2": "GREEN", "3": "BLUE",
-                                 "4": "LIGHT_BLUE", "5": "BLACK", "6": "YELLOW"}.get(current_color, "?")
+                        label = COLOR_LABEL_EN.get(
+                            CODE_TO_KEY.get(current_color), "?"
+                        )
                         if viz_on:
                             cv2.putText(frame, label,
                                         (filtered_center[0] - 20, filtered_center[1] - radius - 10),
@@ -1283,7 +1854,8 @@ def main():
                             # 位置未稳定（或尚未对准）→ capture=0；
                             # 位置稳定且对准 → capture=1，请求下位机抓取
                             would_capture = (
-                                position_stable and cur_offset <= CENTER_TOLERANCE
+                                position_stable
+                                and cur_offset <= GRAB_CENTER_TOLERANCE_PX
                             )
                             capture = would_capture and target_in_roi
                             if would_capture and not target_in_roi:
@@ -1292,10 +1864,36 @@ def main():
                                     f"不在 {roi} 内，暂不抓取"
                                 )
 
+                            # 托盘阶段固定夹爪时：夹爪长度固定，只靠底盘把物块
+                            # 带到固定距离，避免“相机随夹爪伸缩 → 测量滞后 → 闭环震荡”。
+                            _tray_fixed_gripper = (
+                                tray_phase_active
+                                and (TRAY_GRIPPER_FIXED_CUSTOM
+                                     or TRAY_GRIPPER_FIXED_MIN
+                                     or TRAY_GRIPPER_FIXED_MAX)
+                            )
+                            if _tray_fixed_gripper:
+                                if TRAY_GRIPPER_FIXED_CUSTOM:
+                                    track_gripper_cm = TRAY_GRIPPER_EXTEND_CM
+                                    track_fixed_gripper_cm = (
+                                        transformer.min_jar_dis[1]
+                                        + TRAY_GRIPPER_EXTEND_CM
+                                    )
+                                elif TRAY_GRIPPER_FIXED_MAX:
+                                    track_gripper_cm = transformer.MAX_GRIPPER_EXTEND_CM
+                                    track_fixed_gripper_cm = transformer.max_jar_dis[1]
+                                else:
+                                    track_gripper_cm = 0.0
+                                    track_fixed_gripper_cm = transformer.min_jar_dis[1]
+                            else:
+                                track_gripper_cm = current_gripper_cm
+                                track_fixed_gripper_cm = None
+
                             if transformer.CAMERA_FOCAL_PX_X is not None:
                                 block_height = (
                                     transformer.BLOCK_HEIGHT_PLACED_CM
-                                    if slot_index in placed_block_slots
+                                    if (tray_phase_active
+                                        or slot_index in placed_block_slots)
                                     else transformer.BLOCK_HEIGHT_CM
                                 )
                                 block_camera_coord = transformer.pixel_to_camera(
@@ -1304,7 +1902,7 @@ def main():
                                     image_width=frame.shape[1],
                                     image_height=frame.shape[0],
                                     block_height_cm=block_height,
-                                    gripper_extension_cm=current_gripper_cm,
+                                    gripper_extension_cm=track_gripper_cm,
                                 )
                             else:
                                 block_camera_coord = None
@@ -1312,13 +1910,16 @@ def main():
                             if block_camera_coord is not None:
                                 cmd_mm = transformer.command_to_protocol_mm(
                                     block_camera_coord,
-                                    gripper_extension_cm=current_gripper_cm,
+                                    gripper_extension_cm=track_gripper_cm,
+                                    fixed_gripper_cm=track_fixed_gripper_cm,
                                 )
                                 if cmd_mm == (0, 0, 0):
                                     warn_zero_command(
                                         "抓取", block_camera_coord, target_x, target_y
                                     )
                                 chassis_x_mm, chassis_y_mm, gripper_mm = cmd_mm
+                                if track_fixed_gripper_cm is not None:
+                                    gripper_mm = TRAY_GRIPPER_MM
                                 chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
                                     (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
                                 )

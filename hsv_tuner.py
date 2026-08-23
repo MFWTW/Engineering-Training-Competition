@@ -49,8 +49,10 @@ COLOR_LABELS = [' ' + COLOR_LABEL_EN.get(n, n) for n in COLOR_NAMES]
 # 深拷贝一份给 trackbar 运行时修改
 thresholds = copy.deepcopy(color_thresholds)
 
-# ROI 区域 (x, y, w, h)
-ROI = tuple(CONFIG['tuner']['roi'])
+# ROI 区域 (x, y, w, h)：直接跟随检测实际使用的 detection_area，
+# 避免调试画面里的绿色框和真正裁剪区域不一致；为 null 时不画框。
+_DETECTION_AREA = CONFIG['detection'].get('detection_area')
+ROI = tuple(_DETECTION_AREA) if _DETECTION_AREA else None
 
 # 形态学核（与检测代码一致）
 KERNEL = np.ones((int(CONFIG['detection']['kernel_size']),) * 2, np.uint8)
@@ -238,7 +240,7 @@ def main():
 
         # ── 显示 ──
         disp = frame.copy()
-        if show_roi:
+        if show_roi and ROI is not None:
             rx, ry, rw, rh = [int(v) for v in ROI]
             hh, ww = disp.shape[:2]
             rx = max(0, min(rx, ww - 1))

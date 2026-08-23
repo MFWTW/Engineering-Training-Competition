@@ -207,11 +207,12 @@ class BlockDetector:
         cx_full = cx + rx
         cy_full = cy + ry
 
-        # 圆必须完整落在 ROI 内：被 ROI 边缘切掉的残缺圆不能算有效目标，
-        # 否则切边后的圆心会偏向 ROI 边缘，导致“出了区域还被抓取”。
+        # 只要求圆心在 ROI 内。原“整个圆必须完整落在 ROI 内”的校验会
+        # 因形态学膨胀使半径略大，导致物块还没出 ROI（尤其 ROI 上边在
+        # y=0 时）就被误判为无效；抓取前 src.py 还有圆心在 ROI 内的门禁。
         if roi is not None:
-            if not (rx + radius <= cx_full <= rx + rw - radius
-                    and ry + radius <= cy_full <= ry + rh - radius):
+            if not (rx <= cx_full <= rx + rw
+                    and ry <= cy_full <= ry + rh):
                 return None, None, None
 
         # ── 步骤 4：对目标区域画圆、判定颜色 ──
@@ -303,14 +304,16 @@ class BlockDetector:
                 and self.color_stable_count >= self.stability_settings['color_stable_threshold'])
 
     def on_miss(self):
-        """检测缺失/颜色未命中时调用：颜色计数清零，未确认的颜色作废。
+        """检测缺失/颜色未命中时调用：颜色与位置计数都清零。
 
-        位置计数 stable_count 不受影响（保持原有“未检测到时冻结”的语义）；
-        目标重新出现后，颜色计数从 0 重新累计。
+        位置计数也清零并清掉上一帧中心，避免识别闪烁时位置“稳定数”
+        继续累积——必须连续、不间断地识别到目标，才允许抓取。
         """
         self.color_stable_count = 0
         self.last_color = None
         self.final_color = None
+        self.stable_count = 0
+        self.last_center = None
 
     def get_result_data(self, center):
         """稳定后获取格式化发送数据 (9字符: XXXXYYYYC)"""

@@ -11,6 +11,9 @@ DETECTION_CAMERA_SOURCE = 1   # 物块检测/放置识别相机
 # 如果换用支持更高分辨率的相机，请同时用同一分辨率重新标定相机内参。
 DETECTION_FRAME_WIDTH = 640
 DETECTION_FRAME_HEIGHT = 480
+# 物块检测相机目标帧率（fps）。要求摄像头支持该档位，否则 V4L2 会静默忽略，
+# open_camera() 会打印实际生效的帧率并告警，程序仍可运行。
+DETECTION_CAMERA_FPS = 30
 
 
 def _normalize_source(source):
@@ -20,11 +23,12 @@ def _normalize_source(source):
     return source
 
 
-def open_camera(source=0, width=None, height=None):
+def open_camera(source=0, width=None, height=None, fps=None):
     """打开 USB 摄像头，返回 VideoCapture 对象；失败返回 None。
 
     source: 摄像头编号或 /dev/video* 路径
     width/height: 可选，请求的分辨率（不支持时会自动回退）
+    fps: 可选，请求的帧率（摄像头不支持时会自动回退并告警）
     """
     source = _normalize_source(source)
 
@@ -42,10 +46,17 @@ def open_camera(source=0, width=None, height=None):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     if height is not None:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if fps is not None:
+        cap.set(cv2.CAP_PROP_FPS, fps)
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"摄像头已打开 (source: {source}, 实际分辨率 {actual_w}x{actual_h})")
+    actual_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    print(f"摄像头已打开 (source: {source}, 实际分辨率 {actual_w}x{actual_h}, "
+          f"帧率 {actual_fps:.2f}fps)")
+    if fps is not None and actual_fps > 0 and abs(actual_fps - fps) > 1:
+        print(f"警告: 请求 {fps}fps，摄像头实际生效 {actual_fps:.2f}fps，"
+              f"请用 v4l2-ctl --list-formats-ext 确认该分辨率下支持的帧率档位")
 
     # 部分免驱摄像头需要先读一帧才会真正开始输出
     ret, _ = cap.read()

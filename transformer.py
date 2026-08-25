@@ -222,6 +222,65 @@ def pixel_to_camera(
     ]
 
 
+def world_to_pixel(
+    world_mm,
+    gripper_extension_cm=0.0,
+    block_height_cm=BLOCK_HEIGHT_CM,
+    image_width=CALIB_IMAGE_WIDTH,
+    image_height=CALIB_IMAGE_HEIGHT,
+    camera_pitch_deg=None,
+):
+    """
+    车中心系世界坐标(mm) → 图像像素(u, v)（pixel_to_camera 的逆变换，近似）。
+
+    用途：把世界系卡尔曼的滤波位置/预测轨迹画回画面，便于调参观察。
+    忽略畸变（畸变系数很小，仅用于可视化）。
+
+    Returns:
+        (u, v) 或 None（换算无效，例如目标在相机后方/画面外）
+    """
+    if world_mm is None:
+        return None
+    if camera_pitch_deg is None:
+        camera_pitch_deg = CAMERA_PITCH_DEG
+
+    scale_x = image_width / float(CALIB_IMAGE_WIDTH)
+    scale_y = image_height / float(CALIB_IMAGE_HEIGHT)
+    focal_px_x = CAMERA_FOCAL_PX_X * scale_x
+    focal_px_y = CAMERA_FOCAL_PX_Y * scale_y
+    principal_x = CAMERA_PRINCIPAL_PX_X * scale_x
+    principal_y = CAMERA_PRINCIPAL_PX_Y * scale_y
+
+    # 世界(mm) → 相机系(cm)
+    wx_cm = world_mm[0] / 10.0
+    wy_cm = world_mm[1] / 10.0
+    forward_cm = wy_cm - camera1world_coordinate[1] - gripper_extension_cm
+    lateral_cm = wx_cm - camera1world_coordinate[0]
+
+    h_eff = CAMERA_HEIGHT_CM - block_height_cm
+    if h_eff <= 0:
+        return None
+
+    theta = math.radians(camera_pitch_deg)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+
+    # pixel_to_camera 的逆：
+    #   forward = h*(fy*cos - Δv*sin) / (Δv*cos + fy*sin)
+    #   lateral = -Δu * depth / fx，depth = Δv*cos + fy*sin
+    denom = forward_cm * cos_t + h_eff * sin_t
+    if abs(denom) < 1e-6:
+        return None
+    delta_v = focal_px_y * (h_eff * cos_t - forward_cm * sin_t) / denom
+    delta_u = -lateral_cm * focal_px_x / denom
+
+    u = principal_x + delta_u
+    v = principal_y + delta_v
+    if u < 0 or v < 0 or u > image_width - 1 or v > image_height - 1:
+        return None
+    return int(round(u)), int(round(v))
+
+
 def estimate_pitch_deg(
     u,
     v,
@@ -416,6 +475,31 @@ def command_to_protocol_mm(camera_coordinate, gripper_extension_cm=0.0,
         gripper_extension_cm=gripper_extension_cm,
         fixed_gripper_cm=fixed_gripper_cm,
     )
+    if result is None:
+        return 0, 0, 0
+    gripper_mm = int(round(
+        (result["gripper_target_cm"] - min_jar_dis[1]) * 10
+    ))
+    if gripper_mm < 0:
+        gripper_mm = 0
+    return (
+        int(round(result["chassis_x_cm"] * 10)),
+        int(round(result["chassis_y_cm"] * 10)),
+        gripper_mm,
+    )
+
+
+def world_to_protocol_mm(block_world, fixed_gripper_cm=None):
+    """
+    直接用车中心系世界坐标（cm）生成串口指令，跳过像素→相机换算。
+
+    block_world: [x, y, z]，物块相对车中心的坐标（cm，正=左/前/上）
+    fixed_gripper_cm: 固定夹爪位置（相对车中心 cm），None=动态夹爪
+
+    Returns:
+        (chassis_x_mm, chassis_y_mm, gripper_mm)  单位与 command_to_protocol_mm 一致
+    """
+    result = decide_gripper_chassis(block_world, fixed_gripper_cm=fixed_gripper_cm)
     if result is None:
         return 0, 0, 0
     gripper_mm = int(round(

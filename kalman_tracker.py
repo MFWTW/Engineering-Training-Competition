@@ -1,6 +1,11 @@
 """
 卡尔曼滤波物块追踪器 —— 6 维状态（位置+速度+加速度）
 替代神经网络，实现：状态估计 → 去噪 → 速度/加速度推导 → 未来轨迹预测 → 拦截点解算
+
+可选平台反馈（默认关闭）：
+    下位机回传底盘 X/Y 加速度和夹爪加速度后，可把这些量当作“已知控制输入”
+    接入预测步，补偿相机随底盘/夹爪运动造成的物块视运动，减小急加速/减速时的
+    跟踪滞后。关闭时行为与原来的纯视觉卡尔曼完全一致。
 """
 
 import numpy as np
@@ -21,6 +26,16 @@ def _load_kalman_config():
 
 # 卡尔曼滤波调参变量统一从 config.yaml 读取
 KALMAN_CFG = _load_kalman_config()
+
+
+def _load_kalman_world_config():
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return cfg.get("kalman_world", {})
+
+
+# 世界系卡尔曼调参变量（config.yaml → kalman_world）
+KALMAN_WORLD_CFG = _load_kalman_world_config()
 
 
 class KalmanBlockTracker:
@@ -60,6 +75,29 @@ class KalmanBlockTracker:
         self.H = np.zeros((2, 6), dtype=np.float64)
         self.H[0, 0] = 1.0
         self.H[1, 1] = 1.0
+
+        # ── 平台运动反馈（可选，默认关闭） ──
+        pf = KALMAN_CFG.get("platform_feedback", {})
+        self.platform_feedback_enabled = bool(pf.get("enabled", False))
+        pf_px = pf.get("px_per_mm")
+        if pf_px is None:
+            # 未在 kalman 段配置时，跟随 chassis.px_per_mm（下位机 mm → 图像 px）
+            with CONFIG_PATH.open("r", encoding="utf-8") as f:
+                _full_cfg = yaml.safe_load(f)
+            pf_px = _full_cfg.get("chassis", {}).get("px_per_mm", 1.0)
+        self.platform_px_per_mm = float(pf_px)
+        self.platform_gripper_axis = str(pf.get("gripper_axis", "y")).lower()
+        # 平台视加速度 u（px/s²）：u = 相机运动造成的物块视加速度 = -(底盘+夹爪)加速度
+        self.platform_u = np.zeros((2, 1), dtype=np.float64)
+        # 最近一次原始回传值（调试用，当前只有加速度参与滤波）
+        self.last_platform_feedback = {
+            "chassis_ax_mm_s2": 0.0,
+            "chassis_ay_mm_s2": 0.0,
+            "gripper_pos_mm": 0.0,
+            "gripper_vel_mm_s": 0.0,
+            "gripper_acc_mm_s2": 0.0,
+        }
+        self._B = np.zeros((6, 2), dtype=np.float64)
 
         # ── 过程噪声协方差 Q ──
         # 加速度的变化是主要噪声源
@@ -112,11 +150,67 @@ class KalmanBlockTracker:
     def predict(self):
         """
         状态预测（Predict 步）
-        X_pred = F * X
+        X_pred = F * X + B * u
         P_pred = F * P * F^T + Q
+
+        u 为平台视加速度（px/s²），来自底盘/夹爪加速度反馈；
+        平台反馈未启用时 u = 0，等价于原来的 X_pred = F * X。
         """
-        self.X = self.F @ self.X
+        # 控制输入矩阵 B（每个轴：位置 0.5*dt²，速度 dt）
+        # 平台加速度 u 只补偿位置/速度，不写入加速度状态；
+        # 状态里的加速度始终是“物块自身（非平台）”加速度，
+        # 画面里的视加速度 = 状态加速度 + u，由 predict_future 统一叠加。
+        dt, dt2 = self.dt, self.dt * self.dt / 2.0
+        self._B[0, 0] = dt2
+        self._B[1, 1] = dt2
+        self._B[2, 0] = dt
+        self._B[3, 1] = dt
+
+        self.X = self.F @ self.X + self._B @ self.platform_u
         self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def set_platform_feedback(self, chassis_ax_mm_s2=0.0, chassis_ay_mm_s2=0.0,
+                              gripper_pos_mm=0.0, gripper_vel_mm_s=0.0,
+                              gripper_acc_mm_s2=0.0, px_per_mm=None):
+        """
+        把下位机回传的底盘/夹爪运动反馈换算成平台视加速度 u（px/s²）。
+
+        原理：相机装在底盘+夹爪上，平台加速时物块在画面里会产生相反的视运动；
+        已知平台加速度后，预测步用 u 提前补偿，滤波就不需要靠测量慢慢“追”上。
+        语义约定：状态里的 ax/ay 是物块自身（非平台）加速度；
+        画面里的视加速度 = 状态加速度 + u，未来预测时会自动叠加。
+
+        - chassis_ax/ay_mm_s2：底盘 X/Y 加速度（mm/s²）
+        - gripper_pos_mm：夹爪当前位置（mm，当前只保存不参与滤波）
+        - gripper_vel_mm_s：夹爪速度（mm/s，当前只保存不参与滤波）
+        - gripper_acc_mm_s2：夹爪加速度（mm/s²，按 platform_gripper_axis 叠加）
+        - px_per_mm：mm → px 换算；不传用 kalman.platform_feedback.px_per_mm
+        """
+        self.last_platform_feedback = {
+            "chassis_ax_mm_s2": float(chassis_ax_mm_s2),
+            "chassis_ay_mm_s2": float(chassis_ay_mm_s2),
+            "gripper_pos_mm": float(gripper_pos_mm),
+            "gripper_vel_mm_s": float(gripper_vel_mm_s),
+            "gripper_acc_mm_s2": float(gripper_acc_mm_s2),
+        }
+        if not self.platform_feedback_enabled:
+            self.platform_u = np.zeros((2, 1), dtype=np.float64)
+            return
+
+        if px_per_mm is None:
+            px_per_mm = self.platform_px_per_mm
+        px_per_mm = float(px_per_mm)
+
+        # 视加速度 = -平台加速度（平台向前，物块在画面里向后）
+        ux = -float(chassis_ax_mm_s2) * px_per_mm
+        uy = -float(chassis_ay_mm_s2) * px_per_mm
+        # 夹爪伸长方向（世界坐标一般为前进方向 y），映射到图像 x 或 y 轴
+        g_acc_px = -float(gripper_acc_mm_s2) * px_per_mm
+        if self.platform_gripper_axis == "x":
+            ux += g_acc_px
+        else:
+            uy += g_acc_px
+        self.platform_u = np.array([[ux], [uy]], dtype=np.float64)
 
     def update(self, measured_x: float, measured_y: float):
         """
@@ -194,6 +288,12 @@ class KalmanBlockTracker:
         if steps is None:
             steps = int(KALMAN_CFG["predict"]["steps"])
         x, y, vx, vy, ax, ay = self.get_state()
+        # 平台反馈启用时，物块的视加速度 = 状态加速度 + 平台视加速度 u
+        # （假设预测时段内 u 保持最近一次回传值不变）
+        ux = self.platform_u[0, 0] if self.platform_feedback_enabled else 0.0
+        uy = self.platform_u[1, 0] if self.platform_feedback_enabled else 0.0
+        ax += ux
+        ay += uy
         result = []
         for i in range(1, steps + 1):
             t = T * i / steps
@@ -225,6 +325,166 @@ class KalmanBlockTracker:
         """重置滤波器"""
         self.X = np.zeros((6, 1), dtype=np.float64)
         self.P = np.eye(6, dtype=np.float64) * KALMAN_CFG["initial_p"]
+        self.initialized = False
+        self.last_update_time = None
+        self.platform_u = np.zeros((2, 1), dtype=np.float64)
+        self.history.clear()
+
+
+class KalmanWorldTracker:
+    """
+    世界系（车中心坐标系）物块卡尔曼 —— X = [x, y, vx, vy, ax, ay]
+
+    单位：
+        x/y      物块相对车中心的位置（mm，正=左/前，与下位机指令同坐标系）
+        vx/vy    物块相对地面的速度（mm/s，沿车中心系轴向）
+        ax/ay    物块相对地面的加速度（mm/s²）
+
+    测量：每帧把像素检测点经 pixel_to_camera + camera_to_world
+          换算成车中心系坐标（mm）后喂入，速度/加速度由滤波器自行估计。
+
+    控制输入（下位机回传，预测步补偿车自身运动）：
+        ṙ = v_block - v_chassis
+        r̈ = a_block - a_chassis
+    所以底盘速度/加速度真正参与了卡尔曼预测。
+    """
+
+    def __init__(self, dt: float = None, q_acc: float = None,
+                 meas_std: float = None, initial_p: float = None,
+                 history_len: int = None):
+        self.dt = float(KALMAN_WORLD_CFG.get("dt", 1.0 / 30.0)) if dt is None else dt
+
+        # 状态 X = [x, y, vx, vy, ax, ay]（mm、mm/s、mm/s²）
+        self.X = np.zeros((6, 1), dtype=np.float64)
+
+        init_p = KALMAN_WORLD_CFG.get("initial_p", 100.0) if initial_p is None else initial_p
+        self.P = np.eye(6, dtype=np.float64) * init_p
+
+        self.F = np.eye(6, dtype=np.float64)
+        self._update_F()
+
+        # 观测矩阵：只观测车中心系位置 x/y（mm）
+        self.H = np.zeros((2, 6), dtype=np.float64)
+        self.H[0, 0] = 1.0
+        self.H[1, 1] = 1.0
+
+        # 过程噪声（单位 mm² 相关）；q_acc 单位 (mm/s²)²
+        q_acc = KALMAN_WORLD_CFG.get("q_acc", 500.0) if q_acc is None else q_acc
+        dt2 = self.dt * self.dt / 2.0
+        self.Q = np.zeros((6, 6), dtype=np.float64)
+        self.Q[0, 0] = q_acc * dt2 ** 2
+        self.Q[1, 1] = q_acc * dt2 ** 2
+        self.Q[2, 2] = q_acc * self.dt ** 2
+        self.Q[3, 3] = q_acc * self.dt ** 2
+        self.Q[4, 4] = q_acc
+        self.Q[5, 5] = q_acc
+
+        # 测量噪声（mm）
+        meas_std = KALMAN_WORLD_CFG.get("meas_std", 2.0) if meas_std is None else meas_std
+        self.R = np.eye(2, dtype=np.float64) * (meas_std ** 2)
+
+        self.I = np.eye(6, dtype=np.float64)
+        self.initialized = False
+        self.last_update_time = None
+
+        hist_len = KALMAN_WORLD_CFG.get("history_len", 100) if history_len is None else history_len
+        self.history = deque(maxlen=hist_len)
+
+    def _update_F(self):
+        """状态转移（不含控制输入）"""
+        dt, dt2 = self.dt, self.dt * self.dt / 2.0
+        self.F[0, 2] = dt
+        self.F[0, 4] = dt2
+        self.F[1, 3] = dt
+        self.F[1, 5] = dt2
+        self.F[2, 4] = dt
+        self.F[3, 5] = dt
+
+    def set_dt(self, dt: float):
+        self.dt = dt
+        self._update_F()
+
+    def predict(self, chassis_vx_mm_s: float = 0.0, chassis_vy_mm_s: float = 0.0,
+                chassis_ax_mm_s2: float = 0.0, chassis_ay_mm_s2: float = 0.0):
+        """
+        预测步：X = F·X + B·u
+        u = [底盘vx, 底盘vy, 底盘ax, 底盘ay]（下位机回传）
+        车向前/向左运动时，物块相对车中心的位置反向变化。
+        """
+        dt, dt2 = self.dt, self.dt * self.dt / 2.0
+        # 控制输入矩阵 B（6×4）：速度输入影响位置(-dt)、加速度输入影响位置(-dt²/2)和速度(-dt)
+        self.B = np.zeros((6, 4), dtype=np.float64)
+        self.B[0, 0] = -dt
+        self.B[1, 1] = -dt
+        self.B[0, 2] = -dt2
+        self.B[1, 3] = -dt2
+        self.B[2, 2] = -dt
+        self.B[3, 3] = -dt
+        u = np.array([
+            [float(chassis_vx_mm_s)],
+            [float(chassis_vy_mm_s)],
+            [float(chassis_ax_mm_s2)],
+            [float(chassis_ay_mm_s2)],
+        ], dtype=np.float64)
+        self.X = self.F @ self.X + self.B @ u
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def update(self, measured_x_mm: float, measured_y_mm: float):
+        """测量更新：Z = [物块车中心系x(mm), 物块车中心系y(mm)]"""
+        Z = np.array([[float(measured_x_mm)], [float(measured_y_mm)]], dtype=np.float64)
+        if not self.initialized:
+            self.X[0, 0] = float(measured_x_mm)
+            self.X[1, 0] = float(measured_y_mm)
+            self.X[2, 0] = 0.0
+            self.X[3, 0] = 0.0
+            self.X[4, 0] = 0.0
+            self.X[5, 0] = 0.0
+            self.initialized = True
+            self.last_update_time = None
+            self.history.clear()
+            return
+
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        innovation = Z - self.H @ self.X
+        self.X = self.X + K @ innovation
+        self.P = (self.I - K @ self.H) @ self.P
+        self.history.append((self.X[0, 0], self.X[1, 0]))
+
+    def get_state(self) -> tuple:
+        return (
+            float(self.X[0, 0]), float(self.X[1, 0]),
+            float(self.X[2, 0]), float(self.X[3, 0]),
+            float(self.X[4, 0]), float(self.X[5, 0]),
+        )
+
+    def get_position(self) -> tuple:
+        return float(self.X[0, 0]), float(self.X[1, 0])
+
+    def get_velocity(self) -> tuple:
+        return float(self.X[2, 0]), float(self.X[3, 0])
+
+    def get_speed(self) -> float:
+        vx, vy = self.get_velocity()
+        return float(np.sqrt(vx ** 2 + vy ** 2))
+
+    def predict_future(self, T: float = None, steps: int = None) -> list:
+        """按物块自身运动外推（不叠加底盘运动，车会主动跟随）"""
+        if T is None:
+            T = float(KALMAN_WORLD_CFG.get("predict", {}).get("horizon_s", 2.0))
+        if steps is None:
+            steps = int(KALMAN_WORLD_CFG.get("predict", {}).get("steps", 6))
+        x, y, vx, vy, ax, ay = self.get_state()
+        result = []
+        for i in range(1, steps + 1):
+            t = T * i / steps
+            result.append((x + vx * t + 0.5 * ax * t ** 2,
+                           y + vy * t + 0.5 * ay * t ** 2))
+        return result
+
+    def reset(self):
+        self.X = np.zeros((6, 1), dtype=np.float64)
+        self.P = np.eye(6, dtype=np.float64) * KALMAN_WORLD_CFG.get("initial_p", 100.0)
         self.initialized = False
         self.last_update_time = None
         self.history.clear()

@@ -5,7 +5,9 @@ import time
 import logging
 from typing import List, Optional
 
-PACK_FORMAT = "<2B B B B h h H 2B"  # 小端: head(2B) target(1B) action(1B) capture(1B) chassis_x(2B) chassis_y(2B) gripper(2B) tail(2B)
+# 小端: head(2B) target(1B) action(1B) capture(1B)
+#       chassis_x(2B) chassis_y(2B) gripper(2B) tail(2B)
+PACK_FORMAT = "<2B B B B h h H 2B"
 PACK_SIZE = struct.calcsize(PACK_FORMAT)  # 13 字节
 
 logger = logging.getLogger("Gimbal")
@@ -37,7 +39,8 @@ class VisionToGimbal:
         )
         logger.info(
             f"[发送包] target={self.target_} action={self.action_} capture={capture} "
-            f"chassis=({self.chassis_x_mm},{self.chassis_y_mm})mm gripper={self.gripper_mm}mm "
+            f"chassis=({self.chassis_x_mm},{self.chassis_y_mm})mm "
+            f"gripper={self.gripper_mm}mm "
             f"hex={data.hex(' ')} len={len(data)}"
         )
         return data
@@ -45,15 +48,17 @@ class VisionToGimbal:
 class GimbalToVision:
     """底盘→上位机 数据接收与解析"""
 
-    RECV_FORMAT = "<2B H H h h B B B 2B"  # head(2) chassis_x(2) chassis_y(2) chassis_vx(2) chassis_vy(2) capture_ack(1) finish_capture(1) arrived(1) tail(2)
+    # 小端: head(2) chassis_x(2) chassis_y(2) chassis_vx(2) chassis_vy(2)
+    #       capture_ack(1) finish_capture(1) arrived(1) tail(2)
+    RECV_FORMAT = "<2B h h h h B B B 2B"
     RECV_SIZE = struct.calcsize(RECV_FORMAT)  # 15 字节
 
     def __init__(self, chassis_x: int = 0, chassis_y: int = 0,
                  chassis_vx: int = 0, chassis_vy: int = 0,
                  capture_ack: int = 0, finish_capture: int = 0, arrived: int = 0):
         self.head: bytes = b"\x53\x50"
-        self.chassis_x: int = chassis_x      # uint16_t，底盘 X（mm）
-        self.chassis_y: int = chassis_y      # uint16_t，底盘 Y（mm）
+        self.chassis_x: int = chassis_x      # int16_t，底盘 X（mm，可正可负）
+        self.chassis_y: int = chassis_y      # int16_t，底盘 Y（mm，可正可负）
         self.chassis_vx: int = chassis_vx    # int16_t，底盘速度 X 分量（mm/s）
         self.chassis_vy: int = chassis_vy    # int16_t，底盘速度 Y 分量（mm/s）
         self.capture_ack: int = int(capture_ack)        # uint8_t, 1=下位机已收到抓取请求

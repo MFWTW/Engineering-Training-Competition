@@ -11,6 +11,7 @@ from common_camera import (
     DETECTION_CAMERA_SOURCE,
     DETECTION_FRAME_WIDTH,
     DETECTION_FRAME_HEIGHT,
+    DETECTION_CAMERA_FPS,
 )
 from preprocessing import *
 import scan_QRcode_andlist
@@ -19,7 +20,7 @@ from felling_color import (
     block_preprocessing, get_detector, reset_detector,
 )
 from gimbal import SerialComm, VisionToGimbal
-from kalman_tracker import KALMAN_CFG, KalmanBlockTracker
+from kalman_tracker import KALMAN_CFG, KalmanBlockTracker, KalmanWorldTracker
 from one_euro_filter import OneEuroTracker2D
 from intercept_planner import InterceptPlanner
 import transformer
@@ -47,6 +48,15 @@ FILTER_TYPE = str(_cfg("filter", "type", default=None) or (
     "kalman" if KALMAN_CFG.get("enabled", True) else "none"
 )).strip().lower()
 KALMAN_ENABLED = FILTER_TYPE == "kalman"
+KALMAN_WORLD_ENABLED = FILTER_TYPE == "kalman_world"
+# 世界系卡尔曼是否把底盘速度回传作为控制输入（config.yaml → kalman_world）
+_kw_cfg = _cfg("kalman_world", default=None) or {}
+KALMAN_WORLD_USE_CHASSIS_VEL = bool(_kw_cfg.get("use_chassis_velocity", True))
+# 测量用夹爪位置低通系数（config.yaml → kalman_world.gripper_meas_filter）：
+# 夹爪指令跳变时相机原点做低通，越大越跟手（滞后小）、越小越平滑
+KALMAN_WORLD_GRIPPER_MEAS_FILTER = min(
+    1.0, max(0.0, float(_kw_cfg.get("gripper_meas_filter", 0.3)))
+)
 
 # 一欧元低通参数（config.yaml → one_euro）
 ONE_EURO_MIN_CUTOFF = float(_cfg("one_euro", "min_cutoff", default=1.2))
@@ -81,6 +91,14 @@ PLACE_CENTER_TOLERANCE_PX = float(
     _place_center_tol if _place_center_tol is not None
     else (_legacy_center_tol if _legacy_center_tol is not None else 5)
 )
+# 抓取/放置阶段各自独立的 y 轴（上下）对准容差（px）。
+# 未配置时沿用对应 x 轴容差，保持兼容。
+GRAB_CENTER_TOLERANCE_Y_PX = float(
+    _cfg("control", "grab_center_tolerance_y_px", default=GRAB_CENTER_TOLERANCE_PX)
+)
+PLACE_CENTER_TOLERANCE_Y_PX = float(
+    _cfg("control", "place_center_tolerance_y_px", default=PLACE_CENTER_TOLERANCE_PX)
+)
 
 # ==================== 指令发送节流/死区/心跳（config.yaml → tracking） ====================
 # 等待抓取时，若下位机未回传 capture_ack=1，每隔该秒数重发一次 capture=1
@@ -110,6 +128,28 @@ CHASSIS_RAMP_STEP_MM = float(_cfg("tracking", "chassis_ramp_step_mm", default=4.
 # 应大于 TRACKING_SEND_INTERVAL，否则死区不生效；设 None 禁用。
 _send_heartbeat = _cfg("tracking", "send_heartbeat", default=5.0)
 CHASSIS_SEND_HEARTBEAT = None if _send_heartbeat is None else float(_send_heartbeat)
+
+# ==================== 卡尔曼速度前馈（config.yaml → tracking.velocity_feedforward） ====================
+# 用滤波后的物块速度直接折算底盘每周期移动量（增量域速度前馈），
+# 替代“位置误差 × CHASSIS_P_GAIN”；position_gain 只做少量位置修正防漂移。
+_vff_cfg = _cfg("tracking", "velocity_feedforward", default=None) or {}
+VFF_ENABLED = bool(_vff_cfg.get("enabled", False))
+VFF_POSITION_GAIN = float(_vff_cfg.get("position_gain", 0.0))
+VFF_MAX_VEL_MM_S = float(_vff_cfg.get("max_vel_mm_s", 600.0))
+VFF_RAMP_STEP_MM = float(_vff_cfg.get("ramp_step_mm", 30.0))
+if VFF_ENABLED and FILTER_TYPE not in ("kalman", "one_euro", "kalman_world"):
+    print("[警告] velocity_feedforward 需要 filter.type=kalman 或 one_euro 才有速度估计，"
+          "当前为 none，前馈不生效，仍走比例控制")
+
+# ==================== 梯形速度规划（config.yaml → tracking.motion_profile） ====================
+# 无下位机反馈时的平滑方案：v = min(Vmax, sqrt(2*A*|err|)) + 加速度限幅，
+# 让底盘先加速、接近时减速，积分成每包移动量下发。
+_mp_cfg = _cfg("tracking", "motion_profile", default=None) or {}
+MOTION_PROFILE_ENABLED = bool(_mp_cfg.get("enabled", False))
+MOTION_PROFILE_MAX_VEL_MM_S = float(_mp_cfg.get("max_vel_mm_s", 150.0))
+MOTION_PROFILE_ACCEL_MM_S2 = float(_mp_cfg.get("accel_mm_s2", 300.0))
+# 底盘绝对目标模式：chassis_x_mm/y_mm 发绝对目标位置（与回传同一坐标系）
+CHASSIS_ABSOLUTE_TARGET = bool(_cfg("tracking", "chassis_absolute_target", default=False))
 
 # ==================== 显示窗口（config.yaml → display） ====================
 # 宽度或高度超过时按同一比例缩小显示，避免画面超出屏幕；只影响显示，
@@ -248,6 +288,13 @@ COMMAND_PRINT_INTERVAL = float(_cfg("logging", "command_print_interval", default
 # “坐标无效 / 命令全0”警告打印最小间隔（秒）
 WARN_INTERVAL_S = float(_cfg("logging", "warn_interval_s", default=1.0))
 
+# ==================== 运行日志文件（config.yaml → logging.log_file） ====================
+# 每次启动都追加写入该文件：控制台输出会同时写入 log.txt，
+# 并在启动/退出时各写一行时间戳分隔，便于区分多次运行。
+LOG_FILE = Path(_cfg("logging", "log_file", default="log.txt"))
+if not LOG_FILE.is_absolute():
+    LOG_FILE = Path(__file__).resolve().parent / LOG_FILE
+
 # ==================== 拦截规划器（config.yaml → planner） ====================
 PLANNER_CAR_MAX_SPEED = float(_cfg("planner", "car_max_speed_px_per_s", default=200.0))
 PLANNER_CAR_ACCEL = float(_cfg("planner", "car_accel_px_per_s2", default=100.0))
@@ -281,6 +328,7 @@ _serial_comm = None
 _tx_log = deque(maxlen=SERIAL_OVERLAY_MAX)
 _rx_log = deque(maxlen=SERIAL_OVERLAY_MAX)
 _last_rx_key = None
+_last_rx_print = {"t": 0.0}
 _tx_offline_logged = False
 
 
@@ -310,6 +358,15 @@ def log_serial_rx_if_changed(data):
         f"vx={data.chassis_vx} vy={data.chassis_vy} "
         f"ack={data.capture_ack} fin={data.finish_capture} arr={data.arrived}"
     )
+    # 终端打印接收数据（变化时打印，节流 0.5s 防刷屏）
+    now = time.time()
+    if now - _last_rx_print["t"] >= 0.5:
+        _last_rx_print["t"] = now
+        print(
+            f"[RX] chassis=({data.chassis_x},{data.chassis_y})mm "
+            f"v=({data.chassis_vx},{data.chassis_vy})mm/s "
+            f"ack={data.capture_ack} fin={data.finish_capture} arr={data.arrived}"
+        )
 
 
 def draw_serial_overlay(frame):
@@ -439,13 +496,14 @@ def warn_zero_command(tag, camera_coord, u, v):
 def log_command(tag, target, action, capture,
                 chassis_x_mm, chassis_y_mm, gripper_mm,
                 fb_x=0, fb_y=0, fb_vx=0, fb_vy=0,
-                camera_coord=None, world_coord=None):
+                camera_coord=None, world_coord=None,
+                image_center=None):
     """打印当前下发给下位机的底盘/夹爪指令，以及下位机回传的底盘数据。"""
     now = time.time()
     sig = (
         tag, target, action, capture,
         chassis_x_mm, chassis_y_mm, gripper_mm,
-        camera_coord, world_coord,
+        camera_coord, world_coord, image_center,
     )
     if (
         not capture
@@ -466,6 +524,16 @@ def log_command(tag, target, action, capture,
         print(
             f"  相机坐标={camera_coord}cm, "
             f"车中心坐标={world_coord}cm"
+        )
+    if image_center is not None:
+        obj_x, obj_y, center_x, center_y = image_center
+        dx = obj_x - center_x
+        dy = obj_y - center_y
+        dist = np.hypot(dx, dy)
+        print(
+            f"  图像: 物块=({obj_x:.0f},{obj_y:.0f}) "
+            f"图像中心=({center_x},{center_y}) "
+            f"偏移=({dx:+.0f},{dy:+.0f})px 距离={dist:.0f}px"
         )
 
 
@@ -542,7 +610,8 @@ def Sending2Gimbal(data_pack, serial_comm):
 
 # ==================== 主程序 ====================
 def main():
-    global C_1, C_2, chassis_x, chassis_y, chassis_vx, chassis_vy, _serial_comm
+    global C_1, C_2, chassis_x, chassis_y, chassis_vx, chassis_vy
+    global _serial_comm
 
     # 两台 USB 免驱摄像头：cap 用于二维码扫描，detection_cap 用于物块检测/放置
     cap = open_camera(QR_CAMERA_SOURCE)
@@ -553,6 +622,7 @@ def main():
         DETECTION_CAMERA_SOURCE,
         width=DETECTION_FRAME_WIDTH,
         height=DETECTION_FRAME_HEIGHT,
+        fps=DETECTION_CAMERA_FPS,
     )
     if detection_cap is None:
         print("未检测到物块检测 USB 摄像头，退出")
@@ -587,6 +657,9 @@ def main():
 
     # 卡尔曼滤波追踪器（替代神经网络预测），参数从 config.yaml 的 kalman 段读取
     kf = KalmanBlockTracker()
+
+    # 世界系卡尔曼追踪器（filter.type=kalman_world 时使用，状态为车中心系 mm）
+    kwf = KalmanWorldTracker()
 
     # 一欧元低通追踪器（filter.type=one_euro 时使用），参数从 config.yaml 的 one_euro 段读取
     one_euro_tracker = OneEuroTracker2D(
@@ -634,6 +707,8 @@ def main():
     place_last_digit = None     # 放置阶段上一帧选中圆环数字
     placement_recognizer = None
     last_place_dbg = 0.0          # 放置发送调试日志节流
+    last_worldkf_print = 0.0      # 世界系卡尔曼终端调试打印节流
+    last_status_print = 0.0       # 底盘/夹爪状态行打印节流
     target_colors = []          # 当前轮抓取颜色序列（rounds[current_round]["grab"] 的别名）
     target_index = 0
     last_detection_time = None
@@ -645,6 +720,8 @@ def main():
     last_sent_tracking_mm = None     # 最近一次普通跟踪包发送的 (x, y, gripper) mm
     last_smooth_cmd_mm = (0, 0, 0)   # 平滑后的底盘/夹爪指令（ramp 状态）
     last_smooth_time = time.time()   # 最近一次平滑更新时间
+    cmd_vel_mm_s = [0.0, 0.0]        # 梯形速度规划：当前底盘速度 (x, y) mm/s
+    gripper_cm_meas = 0.0            # 测量用夹爪位置（低通，防止指令跳变灌进卡尔曼）
     last_kf_time = None              # 上一帧 KF 更新时间（用于按实际帧间隔更新 dt）
     # 最近一次有效的底盘/夹爪指令；pixel_to_camera 失效时沿用，避免误发 0
     last_valid_mm = (0, 0, 0)
@@ -668,6 +745,7 @@ def main():
         waiting_for_next = False
         detector.reset()
         kf.reset()
+        kwf.reset()
         one_euro_tracker.reset()
         detection_sent = False
         sent_time = None
@@ -676,8 +754,12 @@ def main():
         last_capture_vg = None
         last_tracking_send = 0.0
         last_sent_tracking_mm = None
-        last_smooth_cmd_mm = (0, 0, 0)
+        last_smooth_cmd_mm = (
+            (chassis_x, chassis_y, last_smooth_cmd_mm[2])
+            if CHASSIS_ABSOLUTE_TARGET else (0, 0, 0)
+        )
         last_smooth_time = time.time()
+        cmd_vel_mm_s[0] = cmd_vel_mm_s[1] = 0.0
         last_kf_time = None
         last_detected_center = None
         last_valid_mm = (0, 0, 0)
@@ -704,8 +786,12 @@ def main():
         last_capture_vg = None
         last_tracking_send = 0.0
         last_sent_tracking_mm = None
-        last_smooth_cmd_mm = (0, 0, 0)
+        last_smooth_cmd_mm = (
+            (chassis_x, chassis_y, last_smooth_cmd_mm[2])
+            if CHASSIS_ABSOLUTE_TARGET else (0, 0, 0)
+        )
         last_smooth_time = time.time()
+        cmd_vel_mm_s[0] = cmd_vel_mm_s[1] = 0.0
         last_kf_time = None
         last_valid_mm = (0, 0, 0)
         last_detected_center = None
@@ -716,6 +802,7 @@ def main():
         place_last_digit = None
         detector.reset()
         kf.reset()
+        kwf.reset()
         one_euro_tracker.reset()
 
     def advance_after_placement_cycle():
@@ -787,27 +874,76 @@ def main():
         print("所有轮次完成，退出")
         return "done"
 
-    def smooth_tracking_cmd(cmd_mm, now):
+    def smooth_tracking_cmd(cmd_mm, now, ff_vel_mm_s=None, absolute_target=False):
         """
         把目标移动量平滑成连续小步：
         比例缩放 → 单包限幅 → 按 ramp 限制指令每帧变化量；
         夹爪同样先乘比例增益再按 ramp 限幅，避免增量式指令积分冲顶。
         底盘指令不会从 0 突然跳到几十 mm，也不会在目标附近骤停。
+
+        ff_vel_mm_s: 速度前馈 (vx, vy) mm/s。传入时底盘每周期移动量 =
+            前馈速度×发送周期 + 位置误差×VFF_POSITION_GAIN，替代原比例增益。
+        absolute_target: True 时 x/y 直接作为“绝对目标位置”处理（像夹爪一样），
+            只做 ramp 平滑，不做增益/速度规划。
         """
         nonlocal last_smooth_cmd_mm, last_smooth_time
         x, y, gripper = cmd_mm
-        dx = int(max(-MAX_CHASSIS_STEP_MM,
-                     min(MAX_CHASSIS_STEP_MM, round(x * CHASSIS_P_GAIN))))
-        dy = int(max(-MAX_CHASSIS_STEP_MM,
-                     min(MAX_CHASSIS_STEP_MM, round(y * CHASSIS_P_GAIN))))
+        if absolute_target:
+            # 绝对目标模式：x/y 就是目标位置（mm），只做 ramp 平滑
+            dx = int(round(x))
+            dy = int(round(y))
+        elif ff_vel_mm_s is not None:
+            # 速度前馈：本周期期望位移 = 前馈速度 × 发送周期 + 位置修正
+            dt_cmd = TRACKING_SEND_INTERVAL if TRACKING_SEND_INTERVAL > 0 else 0.05
+            dx = int(max(-MAX_CHASSIS_STEP_MM, min(
+                MAX_CHASSIS_STEP_MM,
+                round(ff_vel_mm_s[0] * dt_cmd + x * VFF_POSITION_GAIN),
+            )))
+            dy = int(max(-MAX_CHASSIS_STEP_MM, min(
+                MAX_CHASSIS_STEP_MM,
+                round(ff_vel_mm_s[1] * dt_cmd + y * VFF_POSITION_GAIN),
+            )))
+        elif MOTION_PROFILE_ENABLED:
+            # 梯形速度规划：目标速度 = min(Vmax, sqrt(2*A*|误差|))，方向取误差方向。
+            # 误差大→加速，接近目标→速度按抛物线减速到 0，即“先加速后减速”。
+            dt_cmd = TRACKING_SEND_INTERVAL if TRACKING_SEND_INTERVAL > 0 else 0.05
+            for i, err in enumerate((x, y)):
+                if abs(err) > 1e-6:
+                    v_tgt = np.copysign(
+                        min(MOTION_PROFILE_MAX_VEL_MM_S,
+                            np.sqrt(2.0 * MOTION_PROFILE_ACCEL_MM_S2 * abs(err))),
+                        err,
+                    )
+                else:
+                    v_tgt = 0.0
+                dv = max(-MOTION_PROFILE_ACCEL_MM_S2 * dt_cmd,
+                         min(MOTION_PROFILE_ACCEL_MM_S2 * dt_cmd, v_tgt - cmd_vel_mm_s[i]))
+                cmd_vel_mm_s[i] += dv
+            dx = int(max(-MAX_CHASSIS_STEP_MM, min(
+                MAX_CHASSIS_STEP_MM, round(cmd_vel_mm_s[0] * dt_cmd))))
+            dy = int(max(-MAX_CHASSIS_STEP_MM, min(
+                MAX_CHASSIS_STEP_MM, round(cmd_vel_mm_s[1] * dt_cmd))))
+        else:
+            dx = int(max(-MAX_CHASSIS_STEP_MM,
+                         min(MAX_CHASSIS_STEP_MM, round(x * CHASSIS_P_GAIN))))
+            dy = int(max(-MAX_CHASSIS_STEP_MM,
+                         min(MAX_CHASSIS_STEP_MM, round(y * CHASSIS_P_GAIN))))
 
         # ramp 按发送周期标定，这里按实际帧间隔缩放
-        dt = min(max(now - last_smooth_time, 0.0), 0.5)
+        # 恢复/断帧后不允许一次性大步补回来：dt 最多按一个发送周期算，
+        # 配合断帧时重置平滑状态，避免“停一下然后猛冲一下”。
+        smooth_dt_cap = (
+            TRACKING_SEND_INTERVAL if TRACKING_SEND_INTERVAL > 0 else 0.5
+        )
+        dt = min(max(now - last_smooth_time, 0.0), smooth_dt_cap)
         if TRACKING_SEND_INTERVAL > 0:
-            ramp = CHASSIS_RAMP_STEP_MM * (dt / TRACKING_SEND_INTERVAL)
+            chassis_ramp_step = (
+                VFF_RAMP_STEP_MM if ff_vel_mm_s is not None else CHASSIS_RAMP_STEP_MM
+            )
+            ramp = chassis_ramp_step * (dt / TRACKING_SEND_INTERVAL)
             gripper_ramp = GRIPPER_RAMP_STEP_MM * (dt / TRACKING_SEND_INTERVAL)
         else:
-            ramp = CHASSIS_RAMP_STEP_MM
+            ramp = VFF_RAMP_STEP_MM if ff_vel_mm_s is not None else CHASSIS_RAMP_STEP_MM
             gripper_ramp = GRIPPER_RAMP_STEP_MM
         ramp = max(ramp, 0.5)
         gripper_ramp = max(gripper_ramp, 0.5)
@@ -815,7 +951,10 @@ def main():
         lx, ly, lz = last_smooth_cmd_mm
         nx = lx + max(-ramp, min(ramp, dx - lx))
         ny = ly + max(-ramp, min(ramp, dy - ly))
-        # 夹爪：先比例增益再限幅（只允许向目标方向缓慢修正）
+        # 夹爪：绝对伸长量协议（0=最短位置，可伸可缩）。
+        # 目标来自视觉换算的物块距离（世界系），平滑收敛到目标，
+        # 目标变小（物块变近/图像中心下方）时 gz 自动减小实现缩回。
+        gripper = max(0.0, float(gripper))
         gz_delta = int(round((gripper - lz) * GRIPPER_P_GAIN))
         gz = lz + max(-gripper_ramp, min(gripper_ramp, gz_delta))
         gz = int(round(min(max(gz, 0), MAX_GRIPPER_MM)))
@@ -959,6 +1098,7 @@ def main():
                     print("识别到QR，关闭二维码USB摄像头")
                     detector.reset()
                     kf.reset()
+                    kwf.reset()
                     one_euro_tracker.reset()
                     detection_sent = False
                     last_detection_time = None
@@ -1000,8 +1140,17 @@ def main():
                         chassis_vx = chassis_data2.chassis_vx
                         chassis_vy = chassis_data2.chassis_vy
 
+                # 每秒固定打印一次底盘/夹爪当前位置（不管值有没有变化）
+                if chassis_data2 is not None and time.time() - last_status_print >= 1.0:
+                    last_status_print = time.time()
+                    print(
+                        f"[状态] 底盘=({chassis_x},{chassis_y})mm "
+                        f"ack={chassis_data2.capture_ack} fin={chassis_data2.finish_capture} "
+                        f"arr={chassis_data2.arrived}"
+                    )
+
                 # 摄像头装在夹爪/云台上，会随夹爪一起伸缩；
-                # 换算“物块相对车中心”时需加上当前夹爪伸长量（取最近一次已下发指令）
+                # 换算“物块相对车中心”时需加上当前夹爪伸长量（最近一次已下发绝对指令）
                 current_gripper_cm = (
                     (last_sent_tracking_mm[2] / 10.0)
                     if last_sent_tracking_mm is not None
@@ -1476,12 +1625,12 @@ def main():
                             place_stable_count >= place_stable_threshold
                         )
 
-                        # 只比较 x 轴（左右）偏差；y 轴对应前后距离，
-                        # 由底盘 y / 夹爪伸长量按 mm 死区闭环，不作为图像对准判据
                         cur_offset = abs(ring_cx - w_img // 2)
+                        cur_y_offset = abs(ring_cy - h_img // 2)
                         capture = (
                             position_stable
                             and cur_offset <= PLACE_CENTER_TOLERANCE_PX
+                            and cur_y_offset <= PLACE_CENTER_TOLERANCE_Y_PX
                         )
                         cv2.putText(
                             frame,
@@ -1553,7 +1702,10 @@ def main():
                             chassis_y_mm=chassis_y_mm,
                             gripper_mm=gripper_mm,
                         )
-                        sent = tracking_send_allowed(capture, desired_mm)
+                        sent = tracking_send_allowed(
+                            capture,
+                            (chassis_x_mm, chassis_y_mm, gripper_mm),
+                        )
                         if sent:
                             enqueue_latest(q, vg)
                             log_command(
@@ -1562,6 +1714,10 @@ def main():
                                 chassis_x, chassis_y, chassis_vx, chassis_vy,
                                 camera_coord=coord,
                                 world_coord=transformer.camera_to_world(coord),
+                                image_center=(
+                                    ring_cx, ring_cy,
+                                    w_img // 2, h_img // 2,
+                                ),
                             )
                         else:
                             now = time.time()
@@ -1569,7 +1725,8 @@ def main():
                                 last_place_dbg = now
                                 print(
                                     f"[放置] 识别到了但未发送: capture={capture} "
-                                    f"cmd={desired_mm} 上次发送={last_sent_tracking_mm} "
+                                    f"cmd={(chassis_x_mm, chassis_y_mm, gripper_mm)} "
+                                    f"上次发送={last_sent_tracking_mm} "
                                     f"距上次发送={now - last_tracking_send:.2f}s "
                                     f"x偏移={cur_offset}px"
                                 )
@@ -1582,7 +1739,16 @@ def main():
                             capture_ack_received = False
                             capture_last_sent_time = time.time()
                             last_capture_vg = vg
-                            print(f"圆环数字 {digit} 已对准(x偏移={cur_offset}px)，放置槽位 {slot_index} 的物块")
+                            place_dist = np.hypot(
+                                ring_cx - w_img // 2,
+                                ring_cy - h_img // 2,
+                            )
+                            print(
+                                f"圆环数字 {digit} 已对准(x偏移={cur_offset}px, "
+                                f"y偏移={cur_y_offset}px, "
+                                f"图像中心距离={place_dist:.0f}px)，"
+                                f"放置槽位 {slot_index} 的物块"
+                            )
 
                         show_detection(frame)
                         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -1686,6 +1852,75 @@ def main():
                             kf.update(current_center[0], current_center[1])
                             last_kf_time = frame_t
                             fx, fy, fvx, fvy, fax, fay = kf.get_state()
+                        elif FILTER_TYPE == "kalman_world":
+                            # 世界系卡尔曼：测量 = 像素 → 车中心系坐标(mm)；
+                            # 底盘速度/加速度作为已知控制输入参与预测。
+                            dt = 1.0 / 30.0
+                            if last_kf_time is not None:
+                                dt = min(max(frame_t - last_kf_time, 0.005), 0.2)
+                            kwf.set_dt(dt)
+
+                            block_height = (
+                                transformer.BLOCK_HEIGHT_PLACED_CM
+                                if (tray_phase_active
+                                    or slot_index in placed_block_slots)
+                                else transformer.BLOCK_HEIGHT_CM
+                            )
+                            # 用回传的夹爪实测位置作为相机位置
+                            # 原始协议无夹爪位置回传，相机原点用最近一次已下发指令；
+                            # 做低通：夹爪指令每帧跳 10mm，不能直接灌进卡尔曼测量
+                            gripper_cm_meas += (
+                                KALMAN_WORLD_GRIPPER_MEAS_FILTER
+                                * (current_gripper_cm - gripper_cm_meas)
+                            )
+                            gripper_cm = gripper_cm_meas
+                            world_measure = None
+                            if transformer.CAMERA_FOCAL_PX_X is not None:
+                                cam_coord = transformer.pixel_to_camera(
+                                    current_center[0], current_center[1],
+                                    image_width=w_img,
+                                    image_height=h_img,
+                                    block_height_cm=block_height,
+                                    gripper_extension_cm=gripper_cm,
+                                )
+                                if cam_coord is not None:
+                                    world_coord = transformer.camera_to_world(
+                                        cam_coord, gripper_extension_cm=gripper_cm
+                                    )
+                                    world_measure = (
+                                        world_coord[0] * 10.0,
+                                        world_coord[1] * 10.0,
+                                    )
+
+                            kwf.predict(
+                                chassis_vx_mm_s=(
+                                    chassis_vx if KALMAN_WORLD_USE_CHASSIS_VEL else 0.0
+                                ),
+                                chassis_vy_mm_s=(
+                                    chassis_vy if KALMAN_WORLD_USE_CHASSIS_VEL else 0.0
+                                ),
+                                chassis_ax_mm_s2=0.0,   # 原始协议无加速度回传
+                                chassis_ay_mm_s2=0.0,
+                            )
+                            if world_measure is not None:
+                                kwf.update(world_measure[0], world_measure[1])
+                            fx, fy, fvx, fvy, fax, fay = kwf.get_state()
+                            last_kf_time = frame_t
+                            # 终端调试：滤波状态 + 原始测量（0.5s 一条）
+                            if time.time() - last_worldkf_print >= 0.5:
+                                last_worldkf_print = time.time()
+                                raw_txt = (
+                                    f"raw=({world_measure[0]:.1f},{world_measure[1]:.1f})mm"
+                                    if world_measure is not None else "raw=无效"
+                                )
+                                print(
+                                    f"[WorldKF] pos=({fx:.1f},{fy:.1f})mm "
+                                    f"vel=({fvx:.1f},{fvy:.1f})mm/s "
+                                    f"acc=({fax:.1f},{fay:.1f})mm/s² "
+                                    f"chassis=({chassis_x},{chassis_y})mm "
+                                    f"cvel=({chassis_vx},{chassis_vy})mm/s "
+                                    f"gripper={gripper_cm:.1f}cm {raw_txt}"
+                                )
                         else:
                             # 不用卡尔曼：直接以当前帧检测中心为准，不估计速度/加速度
                             fx, fy = float(current_center[0]), float(current_center[1])
@@ -1704,10 +1939,34 @@ def main():
                             cv2.circle(frame, current_center, 2, (150, 150, 150), -1)
 
                         # 滤波后（实线粗圈）
-                        filtered_center = (int(fx), int(fy))
-                        if viz_on and viz["draw_filtered"]:
-                            cv2.circle(frame, filtered_center, radius, draw_color, 2)
-                            cv2.circle(frame, filtered_center, 4, draw_color, -1)
+                        if FILTER_TYPE == "kalman_world":
+                            # 世界系状态是 mm：反投影回像素画滤波圈/速度箭头
+                            filtered_center = current_center
+                            world_px = transformer.world_to_pixel(
+                                (fx, fy), gripper_cm, block_height, w_img, h_img
+                            )
+                            if viz_on and viz["draw_filtered"] and world_px is not None:
+                                cv2.circle(frame, world_px, radius, draw_color, 2)
+                                cv2.circle(frame, world_px, 4, draw_color, -1)
+                            if viz_on and viz["draw_speed"] and world_px is not None:
+                                speed = np.hypot(fvx, fvy)
+                                if speed > 1.0:
+                                    k = min(80.0, speed * 0.25) / speed
+                                    tip = (
+                                        int(world_px[0] + fvx * k),
+                                        int(world_px[1] + fvy * k),
+                                    )
+                                    cv2.arrowedLine(frame, world_px, tip,
+                                                    (0, 200, 255), 2, tipLength=0.25)
+                                    cv2.putText(frame, f"V={speed:.0f}mm/s",
+                                                (tip[0] + 5, tip[1]),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                                (0, 200, 255), 1)
+                        else:
+                            filtered_center = (int(fx), int(fy))
+                            if viz_on and viz["draw_filtered"]:
+                                cv2.circle(frame, filtered_center, radius, draw_color, 2)
+                                cv2.circle(frame, filtered_center, 4, draw_color, -1)
 
                         label = COLOR_LABEL_EN.get(
                             CODE_TO_KEY.get(current_color), "?"
@@ -1717,7 +1976,7 @@ def main():
                                         (filtered_center[0] - 20, filtered_center[1] - radius - 10),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2)
                             # 速度标注
-                            if viz["draw_speed"]:
+                            if viz["draw_speed"] and FILTER_TYPE != "kalman_world":
                                 speed = np.sqrt(fvx**2 + fvy**2)
                                 cv2.putText(frame, f"V={speed:.0f}px/s",
                                             (filtered_center[0] + radius + 5, filtered_center[1]),
@@ -1751,7 +2010,8 @@ def main():
                                         cv2.line(frame, p1, p2, (0, 200, 255), 1)
 
                             # ── 预测轨迹（青色，步数/时长由配置控制）──
-                            if viz["draw_trajectory"] or viz["draw_intercept"]:
+                            if (viz["draw_trajectory"] or viz["draw_intercept"]) \
+                                    and FILTER_TYPE != "kalman_world":
                                 if FILTER_TYPE == "kalman":
                                     future = kf.predict_future()
                                 elif FILTER_TYPE == "one_euro":
@@ -1761,7 +2021,7 @@ def main():
                                     )
                                 else:
                                     future = []
-                            if viz["draw_trajectory"]:
+                            if viz["draw_trajectory"] and FILTER_TYPE != "kalman_world":
                                 prev = filtered_center
                                 for i, (px, py) in enumerate(future):
                                     pt = (int(px), int(py))
@@ -1775,7 +2035,7 @@ def main():
                                     prev = pt
 
                             # ── 拦截点（预测轨迹上距中心最近的点）──
-                            if viz["draw_intercept"]:
+                            if viz["draw_intercept"] and FILTER_TYPE != "kalman_world":
                                 all_pts = [filtered_center] + [(int(p[0]), int(p[1])) for p in future]
                                 best_d = float("inf")
                                 best_pt = filtered_center
@@ -1792,9 +2052,32 @@ def main():
                                             (cx + 20, cy - 8),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
+                            # ── 世界系：预测轨迹反投影回像素 ──
+                            if viz["draw_trajectory"] and FILTER_TYPE == "kalman_world":
+                                prev_pt = current_center
+                                for wx, wy in kwf.predict_future():
+                                    pt = transformer.world_to_pixel(
+                                        (wx, wy), gripper_cm, block_height, w_img, h_img
+                                    )
+                                    if pt is None:
+                                        continue
+                                    cv2.line(frame, prev_pt, pt, (0, 255, 255), 1)
+                                    cv2.circle(frame, pt, 2, (0, 255, 255), -1)
+                                    prev_pt = pt
+
+                            # ── 世界系：滤波状态数值叠加显示 ──
+                            if FILTER_TYPE == "kalman_world":
+                                cv2.putText(frame,
+                                            f"World pos=({fx:.0f},{fy:.0f})mm "
+                                            f"vel=({fvx:.0f},{fvy:.0f})mm/s "
+                                            f"acc=({fax:.0f},{fay:.0f})mm/s²",
+                                            (50, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                            (0, 255, 0), 1)
+
                             # 显示检测状态
                             track_label = {
                                 "kalman": "KF",
+                                "kalman_world": "WorldKF",
                                 "one_euro": "OneEuro",
                                 "none": "Raw",
                             }.get(FILTER_TYPE, "Track")
@@ -1819,43 +2102,60 @@ def main():
                             >= detector.stability_settings['threshold']
                         )
                         if not detection_sent and color_stable:
-                            # 颜色稳定后用博弈求解拦截点
-                            car_v = np.hypot(chassis_vx, chassis_vy) * PX_PER_MM
-                            intercept = planner.solve(
-                                block_x=fx, block_y=fy,
-                                block_vx=fvx, block_vy=fvy,
-                                block_ax=fax, block_ay=fay,
-                                car_x=chassis_x * PX_PER_MM,
-                                car_y=chassis_y * PX_PER_MM,
-                                car_v=car_v,
-                            )
-
-                            if intercept and intercept["feasible"]:
-                                target_x, target_y = int(intercept["x"]), int(intercept["y"])
-                                T_solve = intercept["T"]
-                            else:
-                                # 规划无解 → 用当前位置
-                                target_x, target_y = filtered_center
+                            if KALMAN_WORLD_ENABLED:
+                                # 世界系模式：不做像素拦截规划，显示目标用原始检测点
+                                target_x, target_y = current_center
                                 T_solve = 0.0
+                            else:
+                                # 颜色稳定后用博弈求解拦截点
+                                car_v = np.hypot(chassis_vx, chassis_vy) * PX_PER_MM
+                                intercept = planner.solve(
+                                    block_x=fx, block_y=fy,
+                                    block_vx=fvx, block_vy=fvy,
+                                    block_ax=fax, block_ay=fay,
+                                    car_x=chassis_x * PX_PER_MM,
+                                    car_y=chassis_y * PX_PER_MM,
+                                    car_v=car_v,
+                                )
 
-                            # 只比较 x 轴（左右）偏差；y 轴对应前后距离，
-                            # 由底盘 y / 夹爪伸长量按 mm 死区闭环，不作为图像对准判据
-                            cur_offset = abs(fx - cx)
+                                if intercept and intercept["feasible"]:
+                                    target_x, target_y = int(intercept["x"]), int(intercept["y"])
+                                    T_solve = intercept["T"]
+                                else:
+                                    # 规划无解 → 用当前位置
+                                    target_x, target_y = filtered_center
+                                    T_solve = 0.0
+
+                            if KALMAN_WORLD_ENABLED:
+                                # 世界系下 fx/fy 是 mm，对准判断仍用原始像素中心
+                                cur_offset = abs(current_center[0] - w_img // 2)
+                                cur_y_offset = abs(current_center[1] - h_img // 2)
+                            else:
+                                cur_offset = abs(fx - w_img // 2)
+                                cur_y_offset = abs(fy - h_img // 2)
 
                             # 目标中心必须在检测 ROI 内（含滤波滞后），
                             # 防止物块已经跑出区域仍被切边检测/旧滤波位置触发抓取
                             roi = detector.detection_area
-                            target_in_roi = (
-                                roi is None
-                                or (roi[0] <= fx <= roi[0] + roi[2]
-                                    and roi[1] <= fy <= roi[1] + roi[3])
-                            )
+                            if KALMAN_WORLD_ENABLED:
+                                target_in_roi = (
+                                    roi is None
+                                    or (roi[0] <= current_center[0] <= roi[0] + roi[2]
+                                        and roi[1] <= current_center[1] <= roi[1] + roi[3])
+                                )
+                            else:
+                                target_in_roi = (
+                                    roi is None
+                                    or (roi[0] <= fx <= roi[0] + roi[2]
+                                        and roi[1] <= fy <= roi[1] + roi[3])
+                                )
 
                             # 位置未稳定（或尚未对准）→ capture=0；
                             # 位置稳定且对准 → capture=1，请求下位机抓取
                             would_capture = (
                                 position_stable
                                 and cur_offset <= GRAB_CENTER_TOLERANCE_PX
+                                and cur_y_offset <= GRAB_CENTER_TOLERANCE_Y_PX
                             )
                             capture = would_capture and target_in_roi
                             if would_capture and not target_in_roi:
@@ -1889,53 +2189,113 @@ def main():
                                 track_gripper_cm = current_gripper_cm
                                 track_fixed_gripper_cm = None
 
-                            if transformer.CAMERA_FOCAL_PX_X is not None:
-                                block_height = (
-                                    transformer.BLOCK_HEIGHT_PLACED_CM
-                                    if (tray_phase_active
-                                        or slot_index in placed_block_slots)
-                                    else transformer.BLOCK_HEIGHT_CM
-                                )
-                                block_camera_coord = transformer.pixel_to_camera(
-                                    target_x,
-                                    target_y,
-                                    image_width=frame.shape[1],
-                                    image_height=frame.shape[0],
-                                    block_height_cm=block_height,
-                                    gripper_extension_cm=track_gripper_cm,
-                                )
-                            else:
+                            if KALMAN_WORLD_ENABLED:
+                                # 世界系：直接用卡尔曼输出的车中心系坐标(mm→cm)生成指令
                                 block_camera_coord = None
-
-                            if block_camera_coord is not None:
-                                cmd_mm = transformer.command_to_protocol_mm(
-                                    block_camera_coord,
-                                    gripper_extension_cm=track_gripper_cm,
+                                cmd_mm = transformer.world_to_protocol_mm(
+                                    [fx / 10.0, fy / 10.0, 0.0],
                                     fixed_gripper_cm=track_fixed_gripper_cm,
                                 )
                                 if cmd_mm == (0, 0, 0):
                                     warn_zero_command(
-                                        "抓取", block_camera_coord, target_x, target_y
+                                        "抓取", None, current_center[0], current_center[1]
                                     )
                                 chassis_x_mm, chassis_y_mm, gripper_mm = cmd_mm
                                 if track_fixed_gripper_cm is not None:
                                     gripper_mm = TRAY_GRIPPER_MM
+                                if CHASSIS_ABSOLUTE_TARGET:
+                                    # 绝对目标模式（像夹爪一样）：
+                                    # 目标位置 = 回传位置 + 视觉误差
+                                    # x：把物块带到车中心线；y：把物块带到夹爪目标距离处
+                                    grab_dist_mm = (
+                                        transformer.min_jar_dis[1] * 10.0 + gripper_mm
+                                    )
+                                    chassis_x_mm = int(round(chassis_x + fx))
+                                    chassis_y_mm = int(round(
+                                        chassis_y + (fy - grab_dist_mm)
+                                    ))
                                 chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
                                     (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
                                 )
                                 desired_mm = (chassis_x_mm, chassis_y_mm, gripper_mm)
+                                # 前馈：世界系状态的速度就是物块地面速度（mm/s），
+                                # 不需要像素→mm 换算
+                                vff_vel = None
+                                if VFF_ENABLED:
+                                    vff_x, vff_y = fvx, fvy
+                                    vff_speed = np.hypot(vff_x, vff_y)
+                                    if vff_speed > VFF_MAX_VEL_MM_S and vff_speed > 1e-6:
+                                        k = VFF_MAX_VEL_MM_S / vff_speed
+                                        vff_x *= k
+                                        vff_y *= k
+                                    vff_vel = (vff_x, vff_y)
                                 chassis_x_mm, chassis_y_mm, gripper_mm = smooth_tracking_cmd(
-                                    desired_mm, time.time()
+                                    desired_mm, time.time(), ff_vel_mm_s=vff_vel,
+                                    absolute_target=CHASSIS_ABSOLUTE_TARGET,
                                 )
                                 last_valid_mm = (chassis_x_mm, chassis_y_mm, gripper_mm)
                             else:
-                                # 坐标无效时沿用上一帧有效指令，避免下位机误以为停止
-                                chassis_x_mm, chassis_y_mm, gripper_mm = last_valid_mm
-                                desired_mm = last_valid_mm
-                                warn_invalid_coord(
-                                    "抓取", target_x, target_y,
-                                    frame.shape[1], frame.shape[0],
-                                )
+                                if transformer.CAMERA_FOCAL_PX_X is not None:
+                                    block_height = (
+                                        transformer.BLOCK_HEIGHT_PLACED_CM
+                                        if (tray_phase_active
+                                            or slot_index in placed_block_slots)
+                                        else transformer.BLOCK_HEIGHT_CM
+                                    )
+                                    block_camera_coord = transformer.pixel_to_camera(
+                                        target_x,
+                                        target_y,
+                                        image_width=frame.shape[1],
+                                        image_height=frame.shape[0],
+                                        block_height_cm=block_height,
+                                        gripper_extension_cm=track_gripper_cm,
+                                    )
+                                else:
+                                    block_camera_coord = None
+
+                                if block_camera_coord is not None:
+                                    cmd_mm = transformer.command_to_protocol_mm(
+                                        block_camera_coord,
+                                        gripper_extension_cm=track_gripper_cm,
+                                        fixed_gripper_cm=track_fixed_gripper_cm,
+                                    )
+                                    if cmd_mm == (0, 0, 0):
+                                        warn_zero_command(
+                                            "抓取", block_camera_coord, target_x, target_y
+                                        )
+                                    chassis_x_mm, chassis_y_mm, gripper_mm = cmd_mm
+                                    if track_fixed_gripper_cm is not None:
+                                        gripper_mm = TRAY_GRIPPER_MM
+                                    chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
+                                        (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
+                                    )
+                                    desired_mm = (chassis_x_mm, chassis_y_mm, gripper_mm)
+                                    # 卡尔曼速度前馈：
+                                    # 物块世界速度 ≈ 底盘回传速度 - 图像视速度 / PX_PER_MM
+                                    # （近似垂直俯拍假设；带限速保护）
+                                    vff_vel = None
+                                    if (VFF_ENABLED and PX_PER_MM > 0
+                                            and FILTER_TYPE in ("kalman", "one_euro")):
+                                        vff_x = chassis_vx - fvx / PX_PER_MM
+                                        vff_y = chassis_vy - fvy / PX_PER_MM
+                                        vff_speed = np.hypot(vff_x, vff_y)
+                                        if vff_speed > VFF_MAX_VEL_MM_S and vff_speed > 1e-6:
+                                            k = VFF_MAX_VEL_MM_S / vff_speed
+                                            vff_x *= k
+                                            vff_y *= k
+                                        vff_vel = (vff_x, vff_y)
+                                    chassis_x_mm, chassis_y_mm, gripper_mm = smooth_tracking_cmd(
+                                        desired_mm, time.time(), ff_vel_mm_s=vff_vel
+                                    )
+                                    last_valid_mm = (chassis_x_mm, chassis_y_mm, gripper_mm)
+                                else:
+                                    # 坐标无效时沿用上一帧有效指令，避免下位机误以为停止
+                                    chassis_x_mm, chassis_y_mm, gripper_mm = last_valid_mm
+                                    desired_mm = last_valid_mm
+                                    warn_invalid_coord(
+                                        "抓取", target_x, target_y,
+                                        frame.shape[1], frame.shape[0],
+                                    )
 
                             vg = VisionToGimbal(
                                 target=slot_index,
@@ -1945,7 +2305,10 @@ def main():
                                 chassis_y_mm=chassis_y_mm,
                                 gripper_mm=gripper_mm,
                             )
-                            if tracking_send_allowed(capture, desired_mm):
+                            if tracking_send_allowed(
+                                capture,
+                                (chassis_x_mm, chassis_y_mm, gripper_mm),
+                            ):
                                 enqueue_latest(q, vg)
                                 log_command(
                                     "抓取", slot_index, GRAB_ACTION, capture,
@@ -1953,14 +2316,27 @@ def main():
                                     chassis_x, chassis_y, chassis_vx, chassis_vy,
                                     camera_coord=block_camera_coord,
                                     world_coord=(
-                                        transformer.camera_to_world(block_camera_coord)
-                                        if block_camera_coord is not None else None
+                                        [fx / 10.0, fy / 10.0, 0.0]
+                                        if KALMAN_WORLD_ENABLED
+                                        else (transformer.camera_to_world(block_camera_coord)
+                                              if block_camera_coord is not None else None)
+                                    ),
+                                    image_center=(
+                                        (current_center[0], current_center[1],
+                                         w_img // 2, h_img // 2)
+                                        if KALMAN_WORLD_ENABLED
+                                        else (fx, fy, w_img // 2, h_img // 2)
                                     ),
                                 )
 
                                 if capture:
-                                    print(f"物块已对准 (x偏移={cur_offset:.0f}px)，请求抓取 "
-                                          f"颜色{current_color} → 槽位{slot_index}")
+                                    grab_dist = np.hypot(cur_offset, cur_y_offset)
+                                    print(
+                                        f"物块已对准 (x偏移={cur_offset:.0f}px, "
+                                        f"y偏移={cur_y_offset:.0f}px, "
+                                        f"图像中心距离={grab_dist:.0f}px)，请求抓取 "
+                                        f"颜色{current_color} → 槽位{slot_index}"
+                                    )
                                     C_1 = detector.final_color
                                     last_grabbed_slot = slot_index
                                     detection_sent = True
@@ -1973,7 +2349,8 @@ def main():
 
                             if position_stable and not capture:
                                 cv2.putText(frame,
-                                    f"Aligning... off={cur_offset:.0f}px T={T_solve:.2f}s "
+                                    f"Aligning... off={cur_offset:.0f}/{cur_y_offset:.0f}px "
+                                    f"T={T_solve:.2f}s "
                                     f"-> ({target_x},{target_y}) capture=0",
                                     (50, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                     (0, 200, 255), 1)
@@ -1982,6 +2359,15 @@ def main():
                         # 本帧未识别到目标颜色：颜色计数清零，
                         # 重新出现后必须再连续攒够 color_stable_threshold 帧
                         detector.on_miss()
+                        # 同步重置平滑状态，恢复识别后从 0 重新小步爬升，
+                        # 避免用断帧前/后的陈旧时间差一次性补大步。
+                        last_smooth_cmd_mm = (
+                            (chassis_x, chassis_y, last_smooth_cmd_mm[2])
+                            if CHASSIS_ABSOLUTE_TARGET else (0, 0, 0)
+                        )
+                        last_smooth_time = time.time()
+                        last_sent_tracking_mm = None
+                        cmd_vel_mm_s[0] = cmd_vel_mm_s[1] = 0.0
 
                         # 未检测到物块，显示提示
                         target_label = COLOR_LABEL_EN.get(
@@ -2022,5 +2408,77 @@ def main():
         print("资源已释放")
 
 
+class _LogTee:
+    """把 print 同时写到原控制台流和 log.txt，且立即落盘。"""
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log_file = log_file
+
+    def write(self, text):
+        try:
+            self._stream.write(text)
+        except Exception:
+            pass
+        try:
+            self._log_file.write(text)
+            self._log_file.flush()
+        except Exception:
+            pass
+        return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        try:
+            self._log_file.flush()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    from datetime import datetime
+
+    _log_file = None
+    try:
+        _log_file = open(LOG_FILE, "a", encoding="utf-8")
+    except OSError as _log_err:
+        print(f"[日志] 无法打开 {LOG_FILE}：{_log_err}")
+
+    if _log_file is not None:
+        sys.stdout = _LogTee(sys.stdout, _log_file)
+        sys.stderr = _LogTee(sys.stderr, _log_file)
+        _started_at = datetime.now()
+        print(f"\n===== 程序启动 {_started_at:%Y-%m-%d %H:%M:%S} =====")
+
+    try:
+        main()
+    finally:
+        if _log_file is not None:
+            try:
+                _log_file.write(
+                    f"===== 程序退出 {datetime.now():%Y-%m-%d %H:%M:%S}"
+                    f"（本次运行 {datetime.now() - _started_at}） =====\n"
+                )
+                _log_file.flush()
+            except Exception:
+                pass
+
+            # 每次运行结束后自动画图（只画最近一次运行的数据）
+            try:
+                from plot_log import plot_log as _render_log_plot
+                _render_log_plot(
+                    LOG_FILE,
+                    Path(__file__).resolve().parent / "log_plot.png",
+                    last_run=True,
+                )
+            except Exception as _plot_err:
+                print(f"[日志] 绘图失败: {_plot_err}")
+
+            try:
+                _log_file.close()
+            except Exception:
+                pass

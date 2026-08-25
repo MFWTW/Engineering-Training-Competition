@@ -234,6 +234,7 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `safety.max_chassis_step_mm` | `30` | 普通跟踪包单次底盘移动量上限（mm），防止一次给全量偏移过冲 |
 | `logging.command_print_interval` | `0.5` | 指令打印最小间隔（秒），数值变化或超过间隔才打印 |
 | `logging.warn_interval_s` | `1.0` | 坐标无效 / 命令全 0 警告打印最小间隔（秒） |
+| `logging.log_file` | `./log.txt` | 运行日志文件：每次启动自动追加写入，并带启动/退出时间戳分隔 |
 | `planner.car_max_speed_px_per_s` | `200.0` | 小车最大速度（px/s），影响能否追上物块 |
 | `planner.car_accel_px_per_s2` | `100.0` | 小车加速度（px/s²） |
 | `planner.car_decel_px_per_s2` | `150.0` | 小车减速度（px/s²），影响刹车距离 |
@@ -263,6 +264,18 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `visualize.draw_speed` | `true` | 是否绘制滤波速度 `V=xx px/s` |
 | `visualize.draw_history` | `true` | 是否绘制滤波历史轨迹线（橙黄色） |
 | `visualize.history_trail_len` | `60` | 历史轨迹保留最近 N 帧（≤ `history_len`） |
+
+#### kalman_world —— 世界系卡尔曼参数
+
+`filter.type: kalman_world` 时的参数，状态为车中心系 mm，单位与下位机指令一致。
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `dt` | `1/30` | 帧间隔（秒），运行时按实际帧间隔覆盖 |
+| `q_acc` | `400.0` | 过程噪声 (mm/s²)²，越大越信任测量、越跟手 |
+| `meas_std` | `2.0` | 测量噪声（mm），越小越跟手、越大越平滑 |
+| `use_chassis_velocity` | `false` | 底盘速度回传是否参与预测，补偿相机随底盘运动 |
+| `gripper_meas_filter` | `0.3` | 测量用夹爪位置低通系数（0~1），越大滞后越小 |
 
 #### intercept_planner.py —— 拦截规划参数
 
@@ -410,6 +423,16 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 ```bash
 python3 src.py
 ```
+
+程序每次启动都会在 `log.txt` 末尾追加一条带时间戳的启动记录，之后所有控制台输出
+会同时写入该文件，退出时再追加一条本次运行时长；历史日志不会被覆盖。
+每次运行结束还会自动把最近一次运行的底盘/夹爪曲线画到 `log_plot.png`。
+如需后台运行，直接 `nohup python3 src.py >/dev/null 2>&1 &` 即可，日志仍会写入 `log.txt`。
+注意不要再使用 `python3 src.py > log.txt` / `>> log.txt` 这类重定向，否则 shell
+会在程序启动前清空旧日志（`>`），或让同一行日志重复写两份（`>>`）。
+
+也可以单独重新绘图：`python3 plot_log.py log.txt log_plot.png --last-run`
+（不带 `--last-run` 时按整个日志文件绘制）。
 
 | 操作 | 功能 |
 |---|---|

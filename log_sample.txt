@@ -1,0 +1,26 @@
+[抓取] target=1 action=1 capture=0 底盘移动量=(-80,-120)mm 夹爪伸长量=97mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-80,-120)mm 夹爪伸长量=99mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-80,-120)mm 夹爪伸长量=101mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-79,-120)mm 夹爪伸长量=103mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-79,-120)mm 夹爪伸长量=105mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-79,-120)mm 夹爪伸长量=107mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-78,-120)mm 夹爪伸长量=110mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-79,-120)mm 夹爪伸长量=112mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-79,-120)mm 夹爪伸长量=114mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[WorldKF] pos=(21.5,335.3)mm vel=(4.8,72.4)mm/s acc=(-35.1,43.5)mm/s² chassis=(-100,-120)mm cvel=(0,0)mm/s gripper=10.9cm raw=(22.5,336.1)mm
+[抓取] target=1 action=1 capture=0 底盘移动量=(-78,-120)mm 夹爪伸长量=116mm | 下位机回传=(-100,-120)mm v=(0,0)mm/s
+[RX] chassis=(-179,-240)mm v=(0,0)mm/s ack=0 fin=0 arr=1
+[抓取] target=1 action=1 capture=0 底盘移动量=(-81,-123)mm 夹爪伸长量=119mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-84,-126)mm 夹爪伸长量=121mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-87,-129)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-90,-132)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-93,-135)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-96,-138)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-99,-141)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-102,-144)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-105,-147)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-108,-150)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-111,-153)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-114,-156)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[抓取] target=1 action=1 capture=0 底盘移动量=(-117,-159)mm 夹爪伸长量=123mm | 下位机回传=(-179,-240)mm v=(0,0)mm/s
+[RX] chassis=(-296,-399)mm v=(0,0)mm/s ack=0 fin=0 arr=1

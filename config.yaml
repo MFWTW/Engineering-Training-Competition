@@ -120,7 +120,7 @@ detection:
   # 检测就只在该区域内进行，区域外（如自身车轮）不会被识别；
   # 画面中会画出绿色矩形，可按实际位置调整。
   # 检测只要求圆心落在 ROI 内；靠近边缘时形态学膨胀导致的圆外扩不再被拒。
-  detection_area: [40, 30, 560, 350]   # 原来是 null320[40, 100, 560, 350]
+  detection_area: [40, 10, 560, 350]   # 原来是 null320[40, 100, 560, 350]
   kernel_size: 3
   blur:
     kernel: 5
@@ -134,8 +134,8 @@ detection:
     min_area_factor: 0.2
   stability:
     threshold: 15
-    max_pixel_move: 10        # 相邻帧圆心最大位移（px），约 1mm；必须连续 35 帧内抖动小于该值才算稳定
-    color_stable_threshold: 5
+    max_pixel_move: 3        # 相邻帧圆心最大位移（px），约 1mm；必须连续 35 帧内抖动小于该值才算稳定
+    color_stable_threshold: 7
   timeout_ms: 100
 
 # ---- 放置区识别参数（placement.py 读取） ----
@@ -177,7 +177,7 @@ transformer:
   min_jar_dis: [0, 21.595, 0]
   # 左右对齐容差（cm）：按当前相机高度 20cm、物块高 14.3cm 换算，
   # 1cm ≈ 64px；要保证 x 轴 ≤5px，这里需远小于 0.08cm，故取 0.05cm（≈3px）
-  lateral_tolerance_cm: 0.4      # 世界系测量抖动约 ±2mm，容差放至 4mm 防止指令来回翻转
+  lateral_tolerance_cm: 0.3      # 世界系测量抖动约 ±2mm，容差放至 4mm 防止指令来回翻转
   longitudinal_tolerance_cm: 0.4 # 同上
   # 相机标定原图分辨率（内参基准，实际出图分辨率不同时自动按比例缩放）
   calib_image_width: 640
@@ -190,13 +190,13 @@ transformer:
   principal_px_y: 247.66418301001914
   dist_coeffs: [-0.012076444385052124, 0.0016723981571138394, 0.0018108447968222718, -0.002827491845898441, -0.024264465499757897]
   # 相机光心离地高度（cm）
-  camera_height_cm: 20
+  camera_height_cm: 29
   # 物块顶面高度（cm）：抓取区立放物块用这个值（检测点是物块顶面）
   block_height_cm: 14.3
   # 已放置（躺倒）后再次夹取时物块顶面高度（cm）
   block_height_placed_cm: 6.0
   # 相机俯仰角（度），正=向下俯拍；光轴垂直于地面（垂直向下）时填 90
-  camera_pitch_deg: 92
+  camera_pitch_deg: 91
 
 # ---- 位置平滑滤波算法选择（src.py 读取） ----
 filter:
@@ -216,7 +216,7 @@ one_euro:
 
 kalman:
   dt: 0.03333333333333333
-  initial_p: 100.0
+  initial_p: 80.0
   q_acc: 17.0               # 越小越平滑（滤波更信任模型）；太小会显得拖沓
   meas_std: 2.0           # 越大越平滑（更信 任测量是噪声）；太大同样会拖沓
   history_len: 100
@@ -239,7 +239,7 @@ kalman:
 # 底盘位置/速度/加速度回传作为已知控制输入参与预测。
 kalman_world:
   dt: 0.03333333333333333
-  initial_p: 100.0
+  initial_p: 80.0
   q_acc: 400.0              # 过程噪声 (mm/s²)²；速度/加速度发散时调小
   meas_std: 2             # 测量噪声（mm），像素→毫米换算后约 1~3mm
   history_len: 100
@@ -248,13 +248,13 @@ kalman_world:
   use_chassis_velocity: false
   # 测量用夹爪位置低通系数（0~1）：相机随夹爪伸缩，夹爪指令变化时
   # 相机原点做低通防跳变；越大越跟手（滞后小）、越小越平滑
-  gripper_meas_filter: 0.5
+  gripper_meas_filter: 0.2
   predict:
     horizon_s: 2.0
     steps: 3
 
 chassis:
-    px_per_mm: 0.14            #0.165  下位机 mm/mm/s → 图像 px/px/s 的换算倍率（用 calibrate_px_per_mm.py 标定）
+    px_per_mm: 0.15            #0.165  下位机 mm/mm/s → 图像 px/px/s 的换算倍率（用 calibrate_px_per_mm.py 标定）
 
 # =====================================================================
 # 以下为 src.py 主程序可调参数（原 src.py 中的硬编码常量）
@@ -264,8 +264,8 @@ chassis:
 control:
   skip_grab: false             # true=扫描二维码后跳过抓取，直接前往放置区（物块已就位、单独调放置）
   grab_only: false             # true=扫描二维码后只调试抓取：抓完当前轮即退出，跳过放置阶段
-  grab_center_tolerance_px: 20  # 抓取阶段 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求抓取
-  grab_center_tolerance_y_px: 20 # 抓取阶段 y 轴（上下）对准容差（px）：|目标y - 图像中心y| ≤ 该值才请求抓取
+  grab_center_tolerance_px: 15  # 抓取阶段 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求抓取
+  grab_center_tolerance_y_px: 15 # 抓取阶段 y 轴（上下）对准容差（px）：|目标y - 图像中心y| ≤ 该值才请求抓取
   place_center_tolerance_px: 8  # 放置阶段 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求放置
   place_center_tolerance_y_px: 8 # 放置阶段 y 轴（上下）对准容差（px）：|目标y - 图像中心y| ≤ 该值才请求放置
 
@@ -275,16 +275,20 @@ tracking:
   send_interval: 0.02            # 普通跟踪/对准指令（capture=0）最小发送间隔（秒），越小指令越连贯
   chassis_p_gain: 1          # 底盘比例增益：目标偏移先乘以该系数再下发，越靠近移动量越小
   chassis_send_deadband_mm: 1   # 底盘指令变化死区（mm）：目标偏移变化小于该值不重发，避免增量执行被打断
-  gripper_deadband_mm: 1       # 夹爪指令死区（mm）
-  gripper_gain: 0.7            # 夹爪比例增益：每帧只修正测距差值的一半，防闭环震荡
-  gripper_ramp_step_mm: 3      # 夹爪指令每个发送周期变化量上限（mm），避免指令跳变灌进测量
-  chassis_ramp_step_mm: 3      # 平滑跟踪：每个发送周期指令变化量上限（mm），按 send_interval 标定
+  gripper_deadband_mm: 1       # 夹爪指令死区（mm）：绝对目标变化小于该值不重发
+  # 夹爪已改为“绝对目标直发”：不再使用 gripper_gain / gripper_ramp_step_mm（增量式控制已移除）
+  chassis_ramp_step_mm: 20     # 平滑跟踪：每个发送周期指令变化量上限（mm），按 send_interval 标定
   send_heartbeat: 2         # 普通跟踪包心跳间隔（秒），应大于 send_interval；null=禁用
   # ---- 底盘绝对目标模式（像夹爪一样） ----
   # true=发送包里的 chassis_x_mm/y_mm 是“绝对目标位置”（与回传同一坐标系），
   #      下位机自己闭环到位；上位机只做目标平滑，不再发增量。
   # false=保持原来的增量模式。
   chassis_absolute_target: true
+  # ---- 底盘前瞻（Lookahead / Pure Pursuit） ----
+  # 绝对目标模式下，把“物块未来 T 毫秒后的位置”作为底盘目标发给下位机，
+  # 用来补偿视觉/串口/机械延迟，抵消下位机减速；0=关闭。
+  # 一般从 100~200ms 开始试：延迟大/物块快就调大，过冲震荡就调小。
+  chassis_lookahead_ms: 0
   # ---- 卡尔曼速度前馈（替代“位置误差 × 底盘比例增益”） ----
   # 启用后，底盘每周期移动量 = 卡尔曼物块速度折算的期望位移 + 位置修正。
   # 需要 filter.type=kalman 或 one_euro 才有速度估计；none 时自动退回比例控制。
@@ -292,8 +296,8 @@ tracking:
   velocity_feedforward:
     enabled: true            # true=使用速度前馈
     position_gain: 0.15      # 位置误差修正比例（0=纯前馈，建议 0.1~0.3 防漂移）
-    max_vel_mm_s: 200        # 前馈速度上限（mm/s），防止异常速度值导致指令过大
-    ramp_step_mm: 30         # 前馈模式下底盘每周期变化量上限（mm），默认同单包限幅
+    max_vel_mm_s: 50        # 前馈速度上限（mm/s），防止异常速度值导致指令过大
+    ramp_step_mm: 100         # 前馈模式下底盘每周期变化量上限（mm），默认同单包限幅
   # ---- 梯形速度规划（无下位机反馈时的平滑方案） ----
   # 开启后底盘指令按“先加速→匀速→减速”的速度曲线生成：
   # v = min(Vmax, sqrt(2×A×|误差|))，加速度限幅平滑，再积分成每包移动量。
@@ -319,9 +323,9 @@ protocol:
 
 # ---- 指令保护 ----
 safety:
-  max_chassis_cmd_mm: 2000     # 底盘单轴指令合理范围上限（mm），越界沿用上一帧有效指令
-  max_gripper_mm: 400          # 夹爪伸长量合理范围上限（mm）
-  max_chassis_step_mm: 30      # 普通跟踪包单次底盘移动量上限（mm），防止一次给全量偏移过冲
+  max_chassis_cmd_mm: 200     # 底盘单轴指令合理范围上限（mm），越界沿用上一帧有效指令
+  max_gripper_mm: 100          # 夹爪伸长量合理范围上限（mm）
+  max_chassis_step_mm: 80      # 普通跟踪包单次底盘移动量上限（mm），防止一次给全量偏移过冲
 
 # ---- 日志打印节流 ----
 logging:

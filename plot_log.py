@@ -6,6 +6,7 @@
 
 支持的行格式（src.py 的打印）:
     [抓取] ... 底盘移动量=(-80,-120)mm 夹爪伸长量=97mm | 下位机回传=(-100,-120)mm ...
+    [抓取] ... 底盘目标位置=(-80,-120)mm 夹爪伸长量=97mm | 下位机回传=(-100,-120)mm ...
     [RX] chassis=(-179,-240)mm v=...
 """
 
@@ -18,11 +19,11 @@ import matplotlib.pyplot as plt
 
 
 GRAB_RE = re.compile(
-    r"底盘移动量=\((?P<tx>-?\d+),(?P<ty>-?\d+)\)mm "
+    r"(?:底盘移动量|底盘目标位置)=\((?P<tx>[+-]?\d+),(?P<ty>[+-]?\d+)\)mm "
     r"夹爪伸长量=(?P<g>\d+)mm \| "
-    r"下位机回传=\((?P<fx>-?\d+),(?P<fy>-?\d+)\)mm"
+    r"下位机回传=\((?P<fx>[+-]?\d+),(?P<fy>[+-]?\d+)\)mm"
 )
-RX_RE = re.compile(r"\[RX\] chassis=\((?P<fx>-?\d+),(?P<fy>-?\d+)\)mm")
+RX_RE = re.compile(r"\[RX\] chassis=\((?P<fx>[+-]?\d+),(?P<fy>[+-]?\d+)\)mm")
 RUN_START_RE = re.compile(
     r"^===== 程序启动 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ====="
 )
@@ -102,19 +103,21 @@ def plot_log(path, out_png, last_run=False):
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
     if last_run and ts:
         fig.suptitle(
-            f"Chassis / Gripper Tracking Curves  (last run {ts}, x = log line)",
+            f"Absolute Chassis Target vs Feedback  (last run {ts}, x = log line)",
             fontsize=13,
         )
     else:
-        fig.suptitle("Chassis / Gripper Tracking Curves  (x = log line)", fontsize=13)
+        fig.suptitle(
+            "Absolute Chassis Target vs Feedback  (x = log line)", fontsize=13
+        )
 
     # 1) 底盘 X：目标 vs 回传
     ax = axes[0]
-    ax.plot(idx, fx, "-o", ms=3, color="#1f77b4", label="chassis_x feedback")
+    ax.plot(idx, fx, "-o", ms=3, color="#1f77b4", label="feedback X (abs mm)")
     txi = [(i, v) for i, v in zip(idx, tx) if v is not None]
     if txi:
         ax.plot([p[0] for p in txi], [p[1] for p in txi], "--s", ms=3,
-                color="#ff7f0e", label="target x")
+                color="#ff7f0e", label="target X (abs mm)")
     ax.axhline(0, color="gray", lw=0.8)
     ax.set_ylabel("X (mm)")
     ax.legend(loc="best")
@@ -122,11 +125,11 @@ def plot_log(path, out_png, last_run=False):
 
     # 2) 底盘 Y
     ax = axes[1]
-    ax.plot(idx, fy, "-o", ms=3, color="#2ca02c", label="chassis_y feedback")
+    ax.plot(idx, fy, "-o", ms=3, color="#2ca02c", label="feedback Y (abs mm)")
     tyi = [(i, v) for i, v in zip(idx, ty) if v is not None]
     if tyi:
         ax.plot([p[0] for p in tyi], [p[1] for p in tyi], "--s", ms=3,
-                color="#d62728", label="target y")
+                color="#d62728", label="target Y (abs mm)")
     ax.axhline(0, color="gray", lw=0.8)
     ax.set_ylabel("Y (mm)")
     ax.legend(loc="best")

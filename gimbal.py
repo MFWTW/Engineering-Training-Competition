@@ -49,18 +49,21 @@ class GimbalToVision:
     """底盘→上位机 数据接收与解析"""
 
     # 小端: head(2) chassis_x(2) chassis_y(2) chassis_vx(2) chassis_vy(2)
-    #       capture_ack(1) finish_capture(1) arrived(1) tail(2)
-    RECV_FORMAT = "<2B h h h h B B B 2B"
-    RECV_SIZE = struct.calcsize(RECV_FORMAT)  # 15 字节
+    #       gripper(2) capture_ack(1) finish_capture(1) arrived(1) tail(2)
+    # gripper 为夹爪绝对伸长量（uint16，最短位置=0，只会是正数/0）
+    RECV_FORMAT = "<2B h h h h H B B B 2B"
+    RECV_SIZE = struct.calcsize(RECV_FORMAT)  # 17 字节
 
     def __init__(self, chassis_x: int = 0, chassis_y: int = 0,
                  chassis_vx: int = 0, chassis_vy: int = 0,
+                 gripper_mm: int = 0,
                  capture_ack: int = 0, finish_capture: int = 0, arrived: int = 0):
         self.head: bytes = b"\x53\x50"
         self.chassis_x: int = chassis_x      # int16_t，底盘 X（mm，可正可负）
         self.chassis_y: int = chassis_y      # int16_t，底盘 Y（mm，可正可负）
         self.chassis_vx: int = chassis_vx    # int16_t，底盘速度 X 分量（mm/s）
         self.chassis_vy: int = chassis_vy    # int16_t，底盘速度 Y 分量（mm/s）
+        self.gripper_mm: int = int(gripper_mm)  # uint16_t，夹爪绝对伸长量（mm，≥0）
         self.capture_ack: int = int(capture_ack)        # uint8_t, 1=下位机已收到抓取请求
         self.finish_capture: int = int(finish_capture)  # uint8_t, 1=下位机抓取完成
         self.arrived: int = int(arrived)                # uint8_t, 1=已到达指定区域
@@ -79,6 +82,7 @@ class GimbalToVision:
             self.head[0], self.head[1],
             self.chassis_x, self.chassis_y,
             self.chassis_vx, self.chassis_vy,
+            self.gripper_mm,
             self.capture_ack,
             self.finish_capture,
             self.arrived,
@@ -91,7 +95,8 @@ class GimbalToVision:
         if len(data) < cls.RECV_SIZE:
             return None
         try:
-            h0, h1, cx, cy, vx, vy, capture_ack, finish_capture, arrived, t0, t1 = struct.unpack(
+            (h0, h1, cx, cy, vx, vy, gripper_mm,
+             capture_ack, finish_capture, arrived, t0, t1) = struct.unpack(
                 cls.RECV_FORMAT, data[:cls.RECV_SIZE]
             )
             if h0 != 0x53 or h1 != 0x50:
@@ -100,6 +105,7 @@ class GimbalToVision:
                 return None
             result = cls(chassis_x=cx, chassis_y=cy,
                          chassis_vx=vx, chassis_vy=vy,
+                         gripper_mm=gripper_mm,
                          capture_ack=capture_ack, finish_capture=finish_capture,
                          arrived=arrived)
             result.timestamp = time.time()
@@ -256,7 +262,7 @@ class SerialComm:
             return self._latest_chassis
 
     def _chassis_recv_loop(self):
-        """接收线程主循环：按 15 字节帧解析底盘数据"""
+        """接收线程主循环：按 17 字节帧解析底盘数据"""
         buf = b""
         while not self.quit_:
             try:

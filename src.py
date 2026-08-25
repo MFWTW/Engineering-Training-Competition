@@ -112,15 +112,10 @@ CHASSIS_P_GAIN = float(_cfg("tracking", "chassis_p_gain", default=0.5))
 # 底盘指令变化死区（mm）：目标偏移相对上次已发送值变化小于该值时不重发，
 # 避免下位机增量执行过程中被 100→90 这类微小变化反复打断。
 CHASSIS_SEND_DEADBAND_MM = float(_cfg("tracking", "chassis_send_deadband_mm", default=1.0))
-# 夹爪指令死区（mm）
-GRIPPER_DEADBAND_MM = float(_cfg("tracking", "gripper_deadband_mm", default=5))
-# 夹爪比例增益：夹爪指令本质是“上次指令 + 本次测距”的增量式控制，
-# 直接全量累加会因执行滞后/测量抖动而积分冲顶、来回震荡；
-# 该系数只把测距差值按比例修正（0.5=每帧修正一半），配合限幅后稳定收敛。
-GRIPPER_P_GAIN = float(_cfg("tracking", "gripper_gain", default=0.5))
-# 夹爪指令每个发送周期的变化量上限（mm，按 send_interval 标定），
-# 防止 0→84mm 这种一次顶满的积分冲程。
-GRIPPER_RAMP_STEP_MM = float(_cfg("tracking", "gripper_ramp_step_mm", default=5.0))
+# 夹爪指令死区（mm）：夹爪目标为绝对伸长量，变化小于该值时不重发
+GRIPPER_DEADBAND_MM = float(_cfg("tracking", "gripper_deadband_mm", default=1))
+# 夹爪已改为“绝对目标直发”（与底盘绝对目标一致）：
+# 目标直接取视觉换算的绝对伸长量，不再做增量比例增益/ramp 累加。
 # 平滑跟踪：底盘指令每个发送周期的变化量上限（mm，按 send_interval 标定）。
 # 让指令从小步连续爬升/衰减，而不是 0→30mm→0 这样跳变，避免“动一下停一下”。
 CHASSIS_RAMP_STEP_MM = float(_cfg("tracking", "chassis_ramp_step_mm", default=4.0))
@@ -150,6 +145,12 @@ MOTION_PROFILE_MAX_VEL_MM_S = float(_mp_cfg.get("max_vel_mm_s", 150.0))
 MOTION_PROFILE_ACCEL_MM_S2 = float(_mp_cfg.get("accel_mm_s2", 300.0))
 # 底盘绝对目标模式：chassis_x_mm/y_mm 发绝对目标位置（与回传同一坐标系）
 CHASSIS_ABSOLUTE_TARGET = bool(_cfg("tracking", "chassis_absolute_target", default=False))
+# 底盘前瞻时间（秒）：绝对目标模式下，把物块未来 T 秒后的位置作为底盘目标，
+# 补偿视觉/串口/机械延迟（Pure Pursuit / Lookahead）；0=关闭
+CHASSIS_LOOKAHEAD_S = float(
+    _cfg("tracking", "chassis_lookahead_ms", default=0.0)
+) / 1000.0
+CHASSIS_LOOKAHEAD_S = max(0.0, min(CHASSIS_LOOKAHEAD_S, 0.5))
 
 # ==================== 显示窗口（config.yaml → display） ====================
 # 宽度或高度超过时按同一比例缩小显示，避免画面超出屏幕；只影响显示，
@@ -348,6 +349,7 @@ def log_serial_rx_if_changed(data):
     key = (
         data.chassis_x, data.chassis_y,
         data.chassis_vx, data.chassis_vy,
+        data.gripper_mm,
         data.capture_ack, data.finish_capture, data.arrived,
     )
     if key == _last_rx_key:
@@ -356,6 +358,7 @@ def log_serial_rx_if_changed(data):
     log_serial_rx(
         f"x={data.chassis_x} y={data.chassis_y} "
         f"vx={data.chassis_vx} vy={data.chassis_vy} "
+        f"g={data.gripper_mm} "
         f"ack={data.capture_ack} fin={data.finish_capture} arr={data.arrived}"
     )
     # 终端打印接收数据（变化时打印，节流 0.5s 防刷屏）
@@ -365,6 +368,7 @@ def log_serial_rx_if_changed(data):
         print(
             f"[RX] chassis=({data.chassis_x},{data.chassis_y})mm "
             f"v=({data.chassis_vx},{data.chassis_vy})mm/s "
+            f"gripper={data.gripper_mm}mm "
             f"ack={data.capture_ack} fin={data.finish_capture} arr={data.arrived}"
         )
 
@@ -495,7 +499,7 @@ def warn_zero_command(tag, camera_coord, u, v):
 
 def log_command(tag, target, action, capture,
                 chassis_x_mm, chassis_y_mm, gripper_mm,
-                fb_x=0, fb_y=0, fb_vx=0, fb_vy=0,
+                fb_x=0, fb_y=0, fb_vx=0, fb_vy=0, fb_gripper_mm=0,
                 camera_coord=None, world_coord=None,
                 image_center=None):
     """打印当前下发给下位机的底盘/夹爪指令，以及下位机回传的底盘数据。"""
@@ -514,11 +518,15 @@ def log_command(tag, target, action, capture,
 
     _last_command_print["t"] = now
     _last_command_print["sig"] = sig
+    chassis_label = (
+        "底盘目标位置" if CHASSIS_ABSOLUTE_TARGET else "底盘移动量"
+    )
     print(
         f"[{tag}] target={target} action={action} capture={int(capture)} "
-        f"底盘移动量=({chassis_x_mm:+d},{chassis_y_mm:+d})mm "
+        f"{chassis_label}=({chassis_x_mm:+d},{chassis_y_mm:+d})mm "
         f"夹爪伸长量={gripper_mm}mm | "
-        f"下位机回传=({fb_x},{fb_y})mm v=({fb_vx},{fb_vy})mm/s"
+        f"下位机回传=({fb_x},{fb_y})mm v=({fb_vx},{fb_vy})mm/s "
+        f"gripper反馈={fb_gripper_mm}mm"
     )
     if camera_coord is not None:
         print(
@@ -640,6 +648,10 @@ def main():
     except Exception as e:
         print(f"串口打开失败: {e}")
         _serial_comm = None
+    if CHASSIS_LOOKAHEAD_S > 0.0:
+        print(
+            f"[配置] 底盘前瞻已开启：{CHASSIS_LOOKAHEAD_S * 1000.0:.0f}ms"
+        )
 
     sending_thread = threading.Thread(target=Sending2Gimbal, args=(q, _serial_comm), daemon=True)
     sending_thread.start()
@@ -878,13 +890,13 @@ def main():
         """
         把目标移动量平滑成连续小步：
         比例缩放 → 单包限幅 → 按 ramp 限制指令每帧变化量；
-        夹爪同样先乘比例增益再按 ramp 限幅，避免增量式指令积分冲顶。
+        夹爪为绝对目标直发，不再做增量比例/ramp。
         底盘指令不会从 0 突然跳到几十 mm，也不会在目标附近骤停。
 
         ff_vel_mm_s: 速度前馈 (vx, vy) mm/s。传入时底盘每周期移动量 =
             前馈速度×发送周期 + 位置误差×VFF_POSITION_GAIN，替代原比例增益。
-        absolute_target: True 时 x/y 直接作为“绝对目标位置”处理（像夹爪一样），
-            只做 ramp 平滑，不做增益/速度规划。
+        absolute_target: True 时 x/y 直接作为“绝对目标位置”处理，
+            只做 ramp 平滑，不做增益/速度规划；夹爪本身始终是绝对伸长量直发。
         """
         nonlocal last_smooth_cmd_mm, last_smooth_time
         x, y, gripper = cmd_mm
@@ -941,23 +953,18 @@ def main():
                 VFF_RAMP_STEP_MM if ff_vel_mm_s is not None else CHASSIS_RAMP_STEP_MM
             )
             ramp = chassis_ramp_step * (dt / TRACKING_SEND_INTERVAL)
-            gripper_ramp = GRIPPER_RAMP_STEP_MM * (dt / TRACKING_SEND_INTERVAL)
         else:
             ramp = VFF_RAMP_STEP_MM if ff_vel_mm_s is not None else CHASSIS_RAMP_STEP_MM
-            gripper_ramp = GRIPPER_RAMP_STEP_MM
         ramp = max(ramp, 0.5)
-        gripper_ramp = max(gripper_ramp, 0.5)
 
         lx, ly, lz = last_smooth_cmd_mm
         nx = lx + max(-ramp, min(ramp, dx - lx))
         ny = ly + max(-ramp, min(ramp, dy - ly))
         # 夹爪：绝对伸长量协议（0=最短位置，可伸可缩）。
-        # 目标来自视觉换算的物块距离（世界系），平滑收敛到目标，
-        # 目标变小（物块变近/图像中心下方）时 gz 自动减小实现缩回。
+        # 目标来自视觉换算的物块距离（世界系），直接作为绝对目标下发，
+        # 由下位机自己闭环到位，不再做增量比例/ramp 累加。
         gripper = max(0.0, float(gripper))
-        gz_delta = int(round((gripper - lz) * GRIPPER_P_GAIN))
-        gz = lz + max(-gripper_ramp, min(gripper_ramp, gz_delta))
-        gz = int(round(min(max(gz, 0), MAX_GRIPPER_MM)))
+        gz = int(round(min(gripper, MAX_GRIPPER_MM)))
 
         last_smooth_cmd_mm = (int(round(nx)), int(round(ny)), gz)
         last_smooth_time = now
@@ -1145,17 +1152,20 @@ def main():
                     last_status_print = time.time()
                     print(
                         f"[状态] 底盘=({chassis_x},{chassis_y})mm "
+                        f"gripper={chassis_data2.gripper_mm}mm "
                         f"ack={chassis_data2.capture_ack} fin={chassis_data2.finish_capture} "
                         f"arr={chassis_data2.arrived}"
                     )
 
                 # 摄像头装在夹爪/云台上，会随夹爪一起伸缩；
-                # 换算“物块相对车中心”时需加上当前夹爪伸长量（最近一次已下发绝对指令）
-                current_gripper_cm = (
-                    (last_sent_tracking_mm[2] / 10.0)
-                    if last_sent_tracking_mm is not None
-                    else 0.0
+                # 换算“物块相对车中心”时需加上当前夹爪伸长量。
+                # 下位机回传夹爪绝对位置时优先用反馈；未回传时退回最近一次已下发指令。
+                fb_gripper_mm = (
+                    chassis_data2.gripper_mm
+                    if chassis_data2 is not None
+                    else (last_sent_tracking_mm[2] if last_sent_tracking_mm is not None else 0)
                 )
+                current_gripper_cm = fb_gripper_mm / 10.0
 
                 # ---- 动作确认/完成信号 + 到达信号 ----
                 finish_rising = False
@@ -1712,6 +1722,7 @@ def main():
                                 "放置", slot_index, PLACE_ACTION, capture,
                                 chassis_x_mm, chassis_y_mm, gripper_mm,
                                 chassis_x, chassis_y, chassis_vx, chassis_vy,
+                                fb_gripper_mm=fb_gripper_mm,
                                 camera_coord=coord,
                                 world_coord=transformer.camera_to_world(coord),
                                 image_center=(
@@ -1866,9 +1877,8 @@ def main():
                                     or slot_index in placed_block_slots)
                                 else transformer.BLOCK_HEIGHT_CM
                             )
-                            # 用回传的夹爪实测位置作为相机位置
-                            # 原始协议无夹爪位置回传，相机原点用最近一次已下发指令；
-                            # 做低通：夹爪指令每帧跳 10mm，不能直接灌进卡尔曼测量
+                            # 用回传的夹爪绝对位置作为相机位置；
+                            # 反馈可能量化/抖动，先低通再灌进卡尔曼测量，防止相机原点跳变
                             gripper_cm_meas += (
                                 KALMAN_WORLD_GRIPPER_MEAS_FILTER
                                 * (current_gripper_cm - gripper_cm_meas)
@@ -2205,14 +2215,32 @@ def main():
                                     gripper_mm = TRAY_GRIPPER_MM
                                 if CHASSIS_ABSOLUTE_TARGET:
                                     # 绝对目标模式（像夹爪一样）：
-                                    # 目标位置 = 回传位置 + 视觉误差
+                                    # 目标位置 = 回传位置 + 视觉误差（可选加前瞻）
                                     # x：把物块带到车中心线；y：把物块带到夹爪目标距离处
                                     grab_dist_mm = (
                                         transformer.min_jar_dis[1] * 10.0 + gripper_mm
                                     )
-                                    chassis_x_mm = int(round(chassis_x + fx))
+                                    if CHASSIS_LOOKAHEAD_S > 0.0:
+                                        # 前瞻需要物块“地面速度”：
+                                        # use_chassis_velocity=true 时卡尔曼速度已是地面速度；
+                                        # false 时速度是相对车中心的速度，要补回底盘速度。
+                                        if KALMAN_WORLD_USE_CHASSIS_VEL:
+                                            la_vx, la_vy = fvx, fvy
+                                        else:
+                                            la_vx = fvx + chassis_vx
+                                            la_vy = fvy + chassis_vy
+                                        la_speed = np.hypot(la_vx, la_vy)
+                                        if la_speed > VFF_MAX_VEL_MM_S and la_speed > 1e-6:
+                                            k = VFF_MAX_VEL_MM_S / la_speed
+                                            la_vx *= k
+                                            la_vy *= k
+                                        target_fx = fx + la_vx * CHASSIS_LOOKAHEAD_S
+                                        target_fy = fy + la_vy * CHASSIS_LOOKAHEAD_S
+                                    else:
+                                        target_fx, target_fy = fx, fy
+                                    chassis_x_mm = int(round(chassis_x + target_fx))
                                     chassis_y_mm = int(round(
-                                        chassis_y + (fy - grab_dist_mm)
+                                        chassis_y + (target_fy - grab_dist_mm)
                                     ))
                                 chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
                                     (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
@@ -2314,6 +2342,7 @@ def main():
                                     "抓取", slot_index, GRAB_ACTION, capture,
                                     chassis_x_mm, chassis_y_mm, gripper_mm,
                                     chassis_x, chassis_y, chassis_vx, chassis_vy,
+                                    fb_gripper_mm=fb_gripper_mm,
                                     camera_coord=block_camera_coord,
                                     world_coord=(
                                         [fx / 10.0, fy / 10.0, 0.0]

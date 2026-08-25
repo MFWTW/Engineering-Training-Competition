@@ -222,8 +222,10 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `tracking.send_interval` | `0.1` | 普通跟踪/对准指令（capture=0）的最小发送间隔（秒）；capture=1 与阶段切换等事件包立即发送 |
 | `tracking.chassis_p_gain` | `0.9` | 底盘比例增益：目标偏移 × 该系数后再下发，越靠近移动量越小，避免 0 附近过冲摆动 |
 | `tracking.chassis_send_deadband_mm` | `1` | 底盘指令变化死区（mm）：目标偏移变化小于该值不重发，避免下位机增量执行被打断 |
-| `tracking.gripper_deadband_mm` | `5` | 夹爪指令死区（mm） |
+| `tracking.gripper_deadband_mm` | `1` | 夹爪指令死区（mm）：夹爪为绝对伸长量直发，变化小于该值不重发 |
 | `tracking.chassis_ramp_step_mm` | `4` | 平滑跟踪：每个发送周期底盘指令变化量上限（mm），按 `send_interval` 标定 |
+| `tracking.chassis_absolute_target` | `true` | 底盘指令按绝对目标位置发送（与下位机回传同一坐标系），由下位机自己闭环到位 |
+| `tracking.chassis_lookahead_ms` | `150` | 前瞻时间：把物块未来 T ms 的位置作为底盘目标发给下位机，补偿延迟；`0` 关闭 |
 | `tracking.send_heartbeat` | `5.0` | 普通跟踪包心跳间隔（秒），应大于 `tracking.send_interval`；`null` 禁用 |
 | `display.max_width` / `max_height` | `800` / `540` | 显示窗口最大尺寸（px），宽或高超过时按同一比例缩小，仅影响显示 |
 | `display.serial_overlay.enabled` | `true` | 在画面左下角叠加显示串口收发信息（只用英文/数字，避免中文乱码） |
@@ -394,15 +396,16 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 `capture=1` 表示执行当前动作（抓取或松爪放置）。若某帧像素坐标无法换算成有效运动量，
 上位机会沿用上一帧有效指令，避免误发全 0 导致下位机误判为停止。
 
-#### 底盘 → 上位机（GimbalToVision，15 字节）
+#### 底盘 → 上位机（GimbalToVision，17 字节）
 
 | 字段 | 字节 | 类型 | 说明 |
 |---|---|---|---|
 | head | 2B | uint8×2 | `0x53 0x50` |
-| chassis_x | 2B | uint16 | 底盘 X（mm） |
-| chassis_y | 2B | uint16 | 底盘 Y（mm） |
+| chassis_x | 2B | int16 | 底盘 X（mm） |
+| chassis_y | 2B | int16 | 底盘 Y（mm） |
 | chassis_vx | 2B | int16 | 底盘速度 X 分量（mm/s） |
 | chassis_vy | 2B | int16 | 底盘速度 Y 分量（mm/s） |
+| gripper | 2B | uint16 | 夹爪绝对伸长量（mm，最短位置=0，只会是正数/0） |
 | capture_ack | 1B | uint8 | 1=已收到抓取请求（正在执行） |
 | finish_capture | 1B | uint8 | 1=抓取完成，上位机切换下一目标 |
 | arrived | 1B | uint8 | 1=已到达指定区域（抓取区/放置区） |

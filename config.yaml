@@ -94,7 +94,7 @@ colors:
     - 0
     upper:
     - 180
-    - 107
+    - 162
     - 105
     morph:
       erode: 1
@@ -120,22 +120,20 @@ detection:
   # 检测就只在该区域内进行，区域外（如自身车轮）不会被识别；
   # 画面中会画出绿色矩形，可按实际位置调整。
   # 检测只要求圆心落在 ROI 内；靠近边缘时形态学膨胀导致的圆外扩不再被拒。
-  detection_area: [40, 10, 560, 350]   # 原来是 null320[40, 100, 560, 350]
+  detection_area: [100, 200, 440, 220]   # 原来是 null320[40, 100, 560, 350]
   kernel_size: 3
   blur:
     kernel: 5
     sigma_x: 2
     sigma_y: 2
   circle:
-    min_radius: 33
+    min_radius: 30
     max_radius: 75
-    param1: 25
-    param2: 25
     min_area_factor: 0.2
   stability:
     threshold: 15
-    max_pixel_move: 3        # 相邻帧圆心最大位移（px），约 1mm；必须连续 35 帧内抖动小于该值才算稳定
-    color_stable_threshold: 7
+    max_pixel_move: 10        # 相邻帧圆心最大位移（px），约 1mm；必须连续 35 帧内抖动小于该值才算稳定
+    color_stable_threshold: 5
   timeout_ms: 100
 
 # ---- 放置区识别参数（placement.py 读取） ----
@@ -163,9 +161,12 @@ placement:
   tray_phase_order: reverse          # actual=按实际放置顺序抓取；reverse=倒序抓取
   tray_phase_action: 1              # 托盘抓取动作码（1=抓取），保留兼容
   tray_phase_skip_last_of_round: true  # true=每轮最后一次放置不需要夹起，直接进入下一轮
-  # 托盘阶段夹爪策略：dynamic/null=与抓取一样动态调夹爪；
-  # min=固定最短、max=固定最长、数字=固定伸长mm（如 30）。机构响应慢时动态夹爪
-  # 会因“相机随夹爪伸缩 → 测量滞后”震荡，建议固定夹爪只靠底盘对准。
+  # 托盘阶段夹爪策略：
+  # - reverse（倒序）：保持下方 tray_gripper_fixed 不变（dynamic/null=动态调夹爪、
+  #   min=固定最短、max=固定最长、数字=固定伸长mm）；
+  # - actual（实际顺序）：与第一次抓取一样，复用 tracking.grab_gripper_fixed；
+  #   未配置 grab_gripper_fixed 时同样动态调夹爪。
+  # 机构响应慢时动态夹爪会因“相机随夹爪伸缩 → 测量滞后”震荡，建议固定夹爪只靠底盘对准。
   tray_gripper_fixed: 30
 
 # ---- 坐标转换 / 相机标定 / 夹爪行程（transformer.py 读取） ----
@@ -173,7 +174,7 @@ transformer:
   # 摄像头光心相对世界坐标（车中心）的位置，单位 cm：[x, y, z]
   camera1world_coordinate: [0, 21.595, 20]
   # 夹爪中心距车中心的最远/最近距离（cm），z 轴忽略
-  max_jar_dis: [0, 34.005, 0]
+  max_jar_dis: [0, 37.6, 0]
   min_jar_dis: [0, 21.595, 0]
   # 左右对齐容差（cm）：按当前相机高度 20cm、物块高 14.3cm 换算，
   # 1cm ≈ 64px；要保证 x 轴 ≤5px，这里需远小于 0.08cm，故取 0.05cm（≈3px）
@@ -204,7 +205,7 @@ filter:
   #         kalman_world=世界系卡尔曼（状态为车中心系 mm，使用底盘速度/加速度前馈）
   #         one_euro=一欧元低通
   # 一欧元低通特点是：慢速时平滑去抖、快速时低滞后跟手，适合改善“卡顿感”。
-  type: kalman_world
+  type: none
 
 one_euro:
   min_cutoff: 0.8        # 最小截止频率（Hz），越小越平滑；太小时静止目标会显得“拖”
@@ -240,15 +241,15 @@ kalman:
 kalman_world:
   dt: 0.03333333333333333
   initial_p: 80.0
-  q_acc: 400.0              # 过程噪声 (mm/s²)²；速度/加速度发散时调小
-  meas_std: 2             # 测量噪声（mm），像素→毫米换算后约 1~3mm
+  q_acc: 150.0              # 过程噪声 (mm/s²)²；速度/加速度发散时调小
+  meas_std: 3             # 测量噪声（mm），像素→毫米换算后约 1~3mm
   history_len: 100
   # 底盘回传是否作为已知控制输入参与预测。
   # 回传速度噪声大或符号不确定时先关掉，避免滤波器把控制噪声吸收进物块速度。
   use_chassis_velocity: false
   # 测量用夹爪位置低通系数（0~1）：相机随夹爪伸缩，夹爪指令变化时
   # 相机原点做低通防跳变；越大越跟手（滞后小）、越小越平滑
-  gripper_meas_filter: 0.2
+  gripper_meas_filter: 0.1
   predict:
     horizon_s: 2.0
     steps: 3
@@ -262,10 +263,10 @@ chassis:
 
 # ---- 目标切换与对准 ----
 control:
-  skip_grab: false             # true=扫描二维码后跳过抓取，直接前往放置区（物块已就位、单独调放置）
+  skip_grab: true             # true=扫描二维码后跳过抓取，直接前往放置区（物块已就位、单独调放置）
   grab_only: false             # true=扫描二维码后只调试抓取：抓完当前轮即退出，跳过放置阶段
-  grab_center_tolerance_px: 15  # 抓取阶段 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求抓取
-  grab_center_tolerance_y_px: 15 # 抓取阶段 y 轴（上下）对准容差（px）：|目标y - 图像中心y| ≤ 该值才请求抓取
+  grab_center_tolerance_px: 20  # 抓取阶段 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求抓取
+  grab_center_tolerance_y_px: 20 # 抓取阶段 y 轴（上下）对准容差（px）：|目标y - 图像中心y| ≤ 该值才请求抓取
   place_center_tolerance_px: 8  # 放置阶段 x 轴（左右）对准容差（px）：|目标x - 图像中心x| ≤ 该值即请求放置
   place_center_tolerance_y_px: 8 # 放置阶段 y 轴（上下）对准容差（px）：|目标y - 图像中心y| ≤ 该值才请求放置
 
@@ -273,39 +274,23 @@ control:
 tracking:
   capture_resend_interval: 1.0 # 等待抓取时未收到 capture_ack，重发 capture=1 的间隔（秒）
   send_interval: 0.02            # 普通跟踪/对准指令（capture=0）最小发送间隔（秒），越小指令越连贯
-  chassis_p_gain: 1          # 底盘比例增益：目标偏移先乘以该系数再下发，越靠近移动量越小
-  chassis_send_deadband_mm: 1   # 底盘指令变化死区（mm）：目标偏移变化小于该值不重发，避免增量执行被打断
-  gripper_deadband_mm: 1       # 夹爪指令死区（mm）：绝对目标变化小于该值不重发
-  # 夹爪已改为“绝对目标直发”：不再使用 gripper_gain / gripper_ramp_step_mm（增量式控制已移除）
+  chassis_send_deadband_mm: 2   # 底盘指令变化死区（mm）：目标变化小于该值不重发
+  gripper_deadband_mm: 2       # 夹爪指令死区（mm）：绝对目标变化小于该值不重发
+  grab_gripper_fixed: 40      # 抓取阶段固定夹爪伸长量（mm）：数字=固定夹爪先到位再只靠底盘对准；dynamic/null=动态调夹爪
+  grab_gripper_settle_tolerance_mm: 3   # 固定夹爪先到位：反馈与目标差≤该值才允许底盘跟踪（mm）
+  grab_gripper_settle_timeout_s: 5.0    # 等待夹爪到位超时（秒），超时后继续跟踪避免卡死
+  # 底盘/夹爪均为绝对目标直发：不再做增量比例/ramp（增量式控制已移除）
   chassis_ramp_step_mm: 20     # 平滑跟踪：每个发送周期指令变化量上限（mm），按 send_interval 标定
   send_heartbeat: 2         # 普通跟踪包心跳间隔（秒），应大于 send_interval；null=禁用
-  # ---- 底盘绝对目标模式（像夹爪一样） ----
-  # true=发送包里的 chassis_x_mm/y_mm 是“绝对目标位置”（与回传同一坐标系），
-  #      下位机自己闭环到位；上位机只做目标平滑，不再发增量。
-  # false=保持原来的增量模式。
-  chassis_absolute_target: true
+  # ---- 底盘绝对目标模式（固定启用） ----
+  # 发送包里的 chassis_x_mm/y_mm 是“绝对目标位置”（与回传同一坐标系），
+  # 下位机自己闭环到位；上位机只做目标平滑。
   # ---- 底盘前瞻（Lookahead / Pure Pursuit） ----
   # 绝对目标模式下，把“物块未来 T 毫秒后的位置”作为底盘目标发给下位机，
   # 用来补偿视觉/串口/机械延迟，抵消下位机减速；0=关闭。
   # 一般从 100~200ms 开始试：延迟大/物块快就调大，过冲震荡就调小。
   chassis_lookahead_ms: 0
-  # ---- 卡尔曼速度前馈（替代“位置误差 × 底盘比例增益”） ----
-  # 启用后，底盘每周期移动量 = 卡尔曼物块速度折算的期望位移 + 位置修正。
-  # 需要 filter.type=kalman 或 one_euro 才有速度估计；none 时自动退回比例控制。
-  # 注意：position_gain=0 是纯前馈，静止但偏中心的物块不会主动对准，建议保留小值。
-  velocity_feedforward:
-    enabled: true            # true=使用速度前馈
-    position_gain: 0.15      # 位置误差修正比例（0=纯前馈，建议 0.1~0.3 防漂移）
-    max_vel_mm_s: 50        # 前馈速度上限（mm/s），防止异常速度值导致指令过大
-    ramp_step_mm: 100         # 前馈模式下底盘每周期变化量上限（mm），默认同单包限幅
-  # ---- 梯形速度规划（无下位机反馈时的平滑方案） ----
-  # 开启后底盘指令按“先加速→匀速→减速”的速度曲线生成：
-  # v = min(Vmax, sqrt(2×A×|误差|))，加速度限幅平滑，再积分成每包移动量。
-  # 误差大时加速，接近目标时自动减速，静止物块也不会来回晃。
-  motion_profile:
-    enabled: true            # true=底盘左右/前后都用梯形速度规划
-    max_vel_mm_s: 150        # 最大速度（mm/s），按小车实际能力调
-    accel_mm_s2: 300         # 加减速度（mm/s²），越大越冲、越小越肉
+  chassis_lookahead_max_speed_mm_s: 50  # 前瞻目标速度上限（mm/s），防止异常速度把目标推太远
 
 # ---- 显示窗口 ----
 display:
@@ -323,9 +308,8 @@ protocol:
 
 # ---- 指令保护 ----
 safety:
-  max_chassis_cmd_mm: 200     # 底盘单轴指令合理范围上限（mm），越界沿用上一帧有效指令
-  max_gripper_mm: 100          # 夹爪伸长量合理范围上限（mm）
-  max_chassis_step_mm: 80      # 普通跟踪包单次底盘移动量上限（mm），防止一次给全量偏移过冲
+  max_chassis_cmd_mm: 1000000     # 底盘单轴指令合理范围上限（mm），越界沿用上一帧有效指令
+  max_gripper_mm: 180          # 夹爪伸长量合理范围上限（mm）
 
 # ---- 日志打印节流 ----
 logging:

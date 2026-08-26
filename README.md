@@ -91,7 +91,9 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
 
 1. 到达抓取区（`arrived` 0→1）后，打印“第 X 轮第 Y 次抓取顺序: [...]”，重建 `slot_of_color`；
 2. 每帧只检测当前目标颜色（按序列顺序），颜色稳定后发送跟踪指令 `capture=0`；
-3. 位置稳定且 x 偏移 ≤ `grab_center_tolerance_px`（20px）→ 发送 `capture=1`，记录 `last_grabbed_slot`，进入等待；
+3. 配置了 `grab_gripper_fixed` 时先等夹爪反馈到位（`grab_gripper_settle_*`），
+   之后才允许底盘跟踪；位置稳定且 x 偏移 ≤ `grab_center_tolerance_px`（20px）
+   → 发送 `capture=1`，记录 `last_grabbed_slot`，进入等待；
 4. 未收到 `capture_ack=1` 时每 `capture_resend_interval` 秒重发 `capture=1`；收到 ack 后停止重发；
 5. 下位机执行完回 `finish_capture=1`（0→1 上升沿）：
    - 上位机立即补发 `capture=0` 包；
@@ -126,7 +128,10 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
    `actual`=按实际放置顺序，例如 `2,1,3` → `[2,1,3]`；
 2. 每个托盘按“放置槽位映射”反推出该托盘上的物块颜色，然后复用抓取阶段的
    视觉跟踪逻辑：颜色稳定后跟踪（`capture=0`），位置连续稳定 N 帧且
-   x 偏移 ≤ `grab_center_tolerance_px` 才发 `capture=1`，夹爪像第一次抓取一样动态调整；
+   x 偏移 ≤ `grab_center_tolerance_px` 才发 `capture=1`；
+   `tray_phase_order=reverse`（倒序）时夹爪按 `placement.tray_gripper_fixed` 原策略，
+   `actual` 时与第一次抓取一样（配置了 `tracking.grab_gripper_fixed` 则固定夹爪先到位、
+   再只靠底盘对准；未配置则动态调整）；
 3. 每次收到 `finish_capture=1` 后补发 `capture=0`，等下一次 `arrived` 0→1
    再开始下一个托盘；
 4. 最后一个托盘抓完后，下位机再发 `arrived` 时不再夹起，
@@ -179,10 +184,9 @@ flowchart TD
 > 发送队列上限为 1 包，满时丢弃旧包，避免断线积压后重发过期坐标。
 > 普通跟踪/对准包（capture=0）按 `TRACKING_SEND_INTERVAL` 节流，并且只有当
 > 底盘/夹爪指令相对上次已发送值的变化超过死区（`CHASSIS_SEND_DEADBAND_MM` /
-> `GRIPPER_DEADBAND_MM`）或到达心跳间隔时才发送，避免下位机按“增量移动量”
-> 解析时被 100→90 这类微小变化反复打断；capture=1、阶段切换、区域移动和
-> 重发包仍立即发送。底盘指令先乘以 `CHASSIS_P_GAIN` 再限幅，并按
-> `CHASSIS_RAMP_STEP_MM` 做斜率限幅：指令每个发送周期只变化一小步，
+> `GRIPPER_DEADBAND_MM`）或到达心跳间隔时才发送；capture=1、阶段切换、区域移动和
+> 重发包仍立即发送。底盘为绝对目标位置（与回传同一坐标系），按
+> `CHASSIS_RAMP_STEP_MM` 做斜率限幅：目标每个发送周期只变化一小步，
 > 起步/减速连续爬升，不会“动一下停一下”。
 
 ### 闭环控制流程 (30fps)
@@ -220,12 +224,14 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `control.place_center_tolerance_px` | `5` | 放置阶段 x 轴（左右）对准容差（px）：\|目标x - 图像中心x\| ≤ 该值即请求放置 |
 | `tracking.capture_resend_interval` | `1.0` | 未收到 `capture_ack` 时重发 `capture=1` 的间隔（秒） |
 | `tracking.send_interval` | `0.1` | 普通跟踪/对准指令（capture=0）的最小发送间隔（秒）；capture=1 与阶段切换等事件包立即发送 |
-| `tracking.chassis_p_gain` | `0.9` | 底盘比例增益：目标偏移 × 该系数后再下发，越靠近移动量越小，避免 0 附近过冲摆动 |
-| `tracking.chassis_send_deadband_mm` | `1` | 底盘指令变化死区（mm）：目标偏移变化小于该值不重发，避免下位机增量执行被打断 |
+| `tracking.chassis_send_deadband_mm` | `1` | 底盘目标变化死区（mm）：相对上次已发送值变化小于该值不重发 |
 | `tracking.gripper_deadband_mm` | `1` | 夹爪指令死区（mm）：夹爪为绝对伸长量直发，变化小于该值不重发 |
+| `tracking.grab_gripper_fixed` | `40` | 抓取阶段固定夹爪伸长量（mm）：数字=固定夹爪先到位、再动底盘对准；dynamic/null=动态调夹爪 |
+| `tracking.grab_gripper_settle_tolerance_mm` | `3` | 固定夹爪先到位：夹爪反馈与目标差≤该值才允许底盘跟踪（mm） |
+| `tracking.grab_gripper_settle_timeout_s` | `5.0` | 等待固定夹爪到位超时（秒），超时后继续跟踪避免卡死 |
 | `tracking.chassis_ramp_step_mm` | `4` | 平滑跟踪：每个发送周期底盘指令变化量上限（mm），按 `send_interval` 标定 |
-| `tracking.chassis_absolute_target` | `true` | 底盘指令按绝对目标位置发送（与下位机回传同一坐标系），由下位机自己闭环到位 |
 | `tracking.chassis_lookahead_ms` | `150` | 前瞻时间：把物块未来 T ms 的位置作为底盘目标发给下位机，补偿延迟；`0` 关闭 |
+| `tracking.chassis_lookahead_max_speed_mm_s` | `50` | 前瞻目标速度上限（mm/s），防止异常速度把目标推太远 |
 | `tracking.send_heartbeat` | `5.0` | 普通跟踪包心跳间隔（秒），应大于 `tracking.send_interval`；`null` 禁用 |
 | `display.max_width` / `max_height` | `800` / `540` | 显示窗口最大尺寸（px），宽或高超过时按同一比例缩小，仅影响显示 |
 | `display.serial_overlay.enabled` | `true` | 在画面左下角叠加显示串口收发信息（只用英文/数字，避免中文乱码） |
@@ -341,6 +347,7 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `placement.tray_phase_action` | `1` | 托盘阶段动作码（默认 1=抓取），保留兼容 |
 | `placement.tray_phase_capture` | `true` | 已由视觉跟踪取代：托盘阶段 capture 由位置稳定+对准决定 |
 | `placement.tray_phase_skip_last_of_round` | `true` | `true` 时每轮最后一次放置不需要夹起，直接进入下一轮 |
+| `placement.tray_gripper_fixed` | `30` | 倒序托盘阶段夹爪策略：`dynamic`=动态、`min`/`max`=固定最短/最长、数字=固定伸长 mm；`actual` 顺序时改为复用 `tracking.grab_gripper_fixed` |
 
 #### gimbal.py —— 串口参数
 
@@ -384,15 +391,14 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 `action=0` 为项目启动/空闲状态，`action=1` 为抓取阶段，`action=2` 为放置阶段；
 `target=1~3` 表示物块槽位号
 （抓取时是“这个颜色放到几号槽”，放置时是“从几号槽取物块”）。
-上位机按 `TRACKING_SEND_INTERVAL` 连续发送当前计算出的底盘/夹爪运动量，
+上位机按 `TRACKING_SEND_INTERVAL` 连续发送当前计算出的底盘绝对目标位置/夹爪伸长量，
 指令先经 `CHASSIS_RAMP_STEP_MM` 斜率限幅平滑（每个发送周期只变化一小步），
-再按变化死区 / `CHASSIS_SEND_HEARTBEAT` 节流，避免下位机在增量移动执行过程中
-被微小变化反复打断，同时底盘不会“动一下停一下”；`capture=1` 及阶段切换等事件包仍立即发送；
+再按变化死区 / `CHASSIS_SEND_HEARTBEAT` 节流，避免被微小变化反复打断，
+同时底盘不会“动一下停一下”；`capture=1` 及阶段切换等事件包仍立即发送；
 抓取阶段颜色稳定（连续 `color_stable_threshold` 帧同色）后即开始发送跟踪包移动底盘；
 位置稳定（连续 `threshold` 帧圆心一致）且对准后才发送 `capture=1`。
-即使偏移量很大，单次下发的底盘移动量也会被限制在 `MAX_CHASSIS_STEP_MM`
-（默认 30mm）以内，并且先乘以 `CHASSIS_P_GAIN`（默认 0.9），让车逐次逼近、
-越靠近单步越小，避免一次执行全量偏移导致过冲发散。
+即使偏移量很大，底盘目标也会被 `CHASSIS_RAMP_STEP_MM` 逐帧逼近，
+避免一次执行全量偏移导致过冲发散。
 `capture=1` 表示执行当前动作（抓取或松爪放置）。若某帧像素坐标无法换算成有效运动量，
 上位机会沿用上一帧有效指令，避免误发全 0 导致下位机误判为停止。
 

@@ -106,11 +106,8 @@ CAPTURE_RESEND_INTERVAL = float(_cfg("tracking", "capture_resend_interval", defa
 # 普通跟踪/对准指令（capture=0）的最小发送间隔（秒）；
 # capture=1、阶段切换、区域移动、重发等事件包不受此限制，仍立即发送
 TRACKING_SEND_INTERVAL = float(_cfg("tracking", "send_interval", default=0.5))
-# 底盘比例增益：目标偏移先乘以该系数再下发，越靠近移动量越小，
-# 避免 1~2cm 附近每次修正都刚好过冲、在 0 上下来回摆。
-CHASSIS_P_GAIN = float(_cfg("tracking", "chassis_p_gain", default=0.5))
 # 底盘指令变化死区（mm）：目标偏移相对上次已发送值变化小于该值时不重发，
-# 避免下位机增量执行过程中被 100→90 这类微小变化反复打断。
+# 避免下位机闭环执行过程中被 100→90 这类微小变化反复打断。
 CHASSIS_SEND_DEADBAND_MM = float(_cfg("tracking", "chassis_send_deadband_mm", default=1.0))
 # 夹爪指令死区（mm）：夹爪目标为绝对伸长量，变化小于该值时不重发
 GRIPPER_DEADBAND_MM = float(_cfg("tracking", "gripper_deadband_mm", default=1))
@@ -124,27 +121,10 @@ CHASSIS_RAMP_STEP_MM = float(_cfg("tracking", "chassis_ramp_step_mm", default=4.
 _send_heartbeat = _cfg("tracking", "send_heartbeat", default=5.0)
 CHASSIS_SEND_HEARTBEAT = None if _send_heartbeat is None else float(_send_heartbeat)
 
-# ==================== 卡尔曼速度前馈（config.yaml → tracking.velocity_feedforward） ====================
-# 用滤波后的物块速度直接折算底盘每周期移动量（增量域速度前馈），
-# 替代“位置误差 × CHASSIS_P_GAIN”；position_gain 只做少量位置修正防漂移。
-_vff_cfg = _cfg("tracking", "velocity_feedforward", default=None) or {}
-VFF_ENABLED = bool(_vff_cfg.get("enabled", False))
-VFF_POSITION_GAIN = float(_vff_cfg.get("position_gain", 0.0))
-VFF_MAX_VEL_MM_S = float(_vff_cfg.get("max_vel_mm_s", 600.0))
-VFF_RAMP_STEP_MM = float(_vff_cfg.get("ramp_step_mm", 30.0))
-if VFF_ENABLED and FILTER_TYPE not in ("kalman", "one_euro", "kalman_world"):
-    print("[警告] velocity_feedforward 需要 filter.type=kalman 或 one_euro 才有速度估计，"
-          "当前为 none，前馈不生效，仍走比例控制")
-
-# ==================== 梯形速度规划（config.yaml → tracking.motion_profile） ====================
-# 无下位机反馈时的平滑方案：v = min(Vmax, sqrt(2*A*|err|)) + 加速度限幅，
-# 让底盘先加速、接近时减速，积分成每包移动量下发。
-_mp_cfg = _cfg("tracking", "motion_profile", default=None) or {}
-MOTION_PROFILE_ENABLED = bool(_mp_cfg.get("enabled", False))
-MOTION_PROFILE_MAX_VEL_MM_S = float(_mp_cfg.get("max_vel_mm_s", 150.0))
-MOTION_PROFILE_ACCEL_MM_S2 = float(_mp_cfg.get("accel_mm_s2", 300.0))
-# 底盘绝对目标模式：chassis_x_mm/y_mm 发绝对目标位置（与回传同一坐标系）
-CHASSIS_ABSOLUTE_TARGET = bool(_cfg("tracking", "chassis_absolute_target", default=False))
+# 底盘前瞻目标速度上限（mm/s），防止异常速度把目标推太远
+CHASSIS_LOOKAHEAD_MAX_SPEED_MM_S = float(
+    _cfg("tracking", "chassis_lookahead_max_speed_mm_s", default=50.0)
+)
 # 底盘前瞻时间（秒）：绝对目标模式下，把物块未来 T 秒后的位置作为底盘目标，
 # 补偿视觉/串口/机械延迟（Pure Pursuit / Lookahead）；0=关闭
 CHASSIS_LOOKAHEAD_S = float(
@@ -192,9 +172,6 @@ PLACE_ACTION = int(_cfg("protocol", "place_action", default=2))
 # 底盘/夹爪指令合理范围（mm），防止坐标换算异常时把离谱值发给下位机
 MAX_CHASSIS_CMD_MM = float(_cfg("safety", "max_chassis_cmd_mm", default=2000))
 MAX_GRIPPER_MM = float(_cfg("safety", "max_gripper_mm", default=400))
-# 普通跟踪包单次允许下发的底盘移动量上限（mm）。限制为小步后，
-# 车会逐次逼近而不是一次发全量偏移大幅来回甩。
-MAX_CHASSIS_STEP_MM = float(_cfg("safety", "max_chassis_step_mm", default=50))
 
 # ==================== 放置阶段夹爪策略（config.yaml → placement） ====================
 # gripper_fixed: min=固定最短(0mm伸长)只调底盘；max=固定最长(84mm伸长)只调底盘；
@@ -242,13 +219,15 @@ PLACE_STABLE_MAX_MOVE = float(_cfg("placement", "place_stable_max_pixel_move", d
 # 抓取顺序由 tray_phase_order 决定：actual=按实际放置顺序，reverse=倒序。
 TRAY_PHASE_ENABLED = bool(_cfg("placement", "tray_phase_enabled", default=True))
 TRAY_PHASE_ORDER = str(_cfg("placement", "tray_phase_order", default="reverse")).strip().lower()
+TRAY_PHASE_IS_REVERSE = TRAY_PHASE_ORDER in ("reverse", "reversed", "倒序")
 TRAY_PHASE_ACTION = int(_cfg("placement", "tray_phase_action", default=GRAB_ACTION))
 TRAY_PHASE_CAPTURE = bool(_cfg("placement", "tray_phase_capture", default=True))
 TRAY_PHASE_SKIP_LAST_OF_ROUND = bool(
     _cfg("placement", "tray_phase_skip_last_of_round", default=True)
 )
 # 托盘阶段夹爪策略（config.yaml → placement.tray_gripper_fixed）：
-# dynamic/null=动态调夹爪；min/max/数字mm=固定夹爪长度，只靠底盘对准。
+# 倒序托盘阶段保持该策略（dynamic/null=动态调夹爪；min/max/数字mm=固定夹爪长度，
+# 只靠底盘对准）；非倒序（actual）托盘阶段复用第一次抓取方式。
 # 相机装在夹爪上，机构响应慢时动态夹爪的“测量→指令”闭环会震荡，
 # 固定夹爪后底盘有回传反馈能收敛，彻底绕开这个环。
 _tray_gripper_fixed_cfg = _cfg("placement", "tray_gripper_fixed", default=None)
@@ -282,6 +261,35 @@ else:
     TRAY_GRIPPER_MM = (
         0 if TRAY_GRIPPER_FIXED_MIN else transformer.MAX_GRIPPER_EXTEND_MM
     )
+
+# 抓取阶段夹爪策略（config.yaml → tracking.grab_gripper_fixed）：
+# dynamic/null=动态调夹爪；数字mm=固定夹爪伸长量，只靠底盘对准（与托盘阶段同理）。
+_grab_fixed_cfg = _cfg("tracking", "grab_gripper_fixed", default=None)
+GRAB_GRIPPER_FIXED_CUSTOM = False
+GRAB_GRIPPER_EXTEND_MM = 0
+GRAB_GRIPPER_EXTEND_CM = 0.0
+GRAB_GRIPPER_MM = 0
+try:
+    _grab_fixed_mm = float(_grab_fixed_cfg)
+except (TypeError, ValueError):
+    _grab_fixed_mm = None
+if _grab_fixed_mm is not None:
+    GRAB_GRIPPER_FIXED_CUSTOM = True
+    GRAB_GRIPPER_EXTEND_MM = int(round(_grab_fixed_mm))
+    GRAB_GRIPPER_EXTEND_MM = min(
+        max(GRAB_GRIPPER_EXTEND_MM, 0), transformer.MAX_GRIPPER_EXTEND_MM
+    )
+    GRAB_GRIPPER_EXTEND_CM = GRAB_GRIPPER_EXTEND_MM / 10.0
+    GRAB_GRIPPER_MM = GRAB_GRIPPER_EXTEND_MM
+
+# 固定夹爪抓取时，先等夹爪反馈到位再动底盘（倒序托盘阶段除外）：
+# 避免夹爪还在伸长时底盘就带着相机移动，造成测量/对准偏差。
+GRIPPER_SETTLE_TOLERANCE_MM = float(
+    _cfg("tracking", "grab_gripper_settle_tolerance_mm", default=3.0)
+)
+GRIPPER_SETTLE_TIMEOUT_S = float(
+    _cfg("tracking", "grab_gripper_settle_timeout_s", default=5.0)
+)
 
 # ==================== 日志打印节流（config.yaml → logging） ====================
 # 指令打印节流：数值变化或超过该间隔才打印一次，避免每帧刷屏
@@ -518,9 +526,7 @@ def log_command(tag, target, action, capture,
 
     _last_command_print["t"] = now
     _last_command_print["sig"] = sig
-    chassis_label = (
-        "底盘目标位置" if CHASSIS_ABSOLUTE_TARGET else "底盘移动量"
-    )
+    chassis_label = "底盘目标位置"
     print(
         f"[{tag}] target={target} action={action} capture={int(capture)} "
         f"{chassis_label}=({chassis_x_mm:+d},{chassis_y_mm:+d})mm "
@@ -732,8 +738,10 @@ def main():
     last_sent_tracking_mm = None     # 最近一次普通跟踪包发送的 (x, y, gripper) mm
     last_smooth_cmd_mm = (0, 0, 0)   # 平滑后的底盘/夹爪指令（ramp 状态）
     last_smooth_time = time.time()   # 最近一次平滑更新时间
-    cmd_vel_mm_s = [0.0, 0.0]        # 梯形速度规划：当前底盘速度 (x, y) mm/s
     gripper_cm_meas = 0.0            # 测量用夹爪位置（低通，防止指令跳变灌进卡尔曼）
+    gripper_settle_target_mm = None  # 当前等待到位的固定夹爪目标（mm），None=不需要等待
+    gripper_settle_started = None    # 开始等待夹爪到位的时间戳
+    gripper_settle_done = True       # 夹爪是否已到位（或超时）
     last_kf_time = None              # 上一帧 KF 更新时间（用于按实际帧间隔更新 dt）
     # 最近一次有效的底盘/夹爪指令；pixel_to_camera 失效时沿用，避免误发 0
     last_valid_mm = (0, 0, 0)
@@ -766,12 +774,8 @@ def main():
         last_capture_vg = None
         last_tracking_send = 0.0
         last_sent_tracking_mm = None
-        last_smooth_cmd_mm = (
-            (chassis_x, chassis_y, last_smooth_cmd_mm[2])
-            if CHASSIS_ABSOLUTE_TARGET else (0, 0, 0)
-        )
+        last_smooth_cmd_mm = (chassis_x, chassis_y, last_smooth_cmd_mm[2])
         last_smooth_time = time.time()
-        cmd_vel_mm_s[0] = cmd_vel_mm_s[1] = 0.0
         last_kf_time = None
         last_detected_center = None
         last_valid_mm = (0, 0, 0)
@@ -790,6 +794,7 @@ def main():
         nonlocal last_valid_mm, last_detected_center, last_detection_time, last_kf_time
         nonlocal recognition_started
         nonlocal place_stable_count, place_last_center, place_last_digit
+        nonlocal gripper_settle_target_mm, gripper_settle_started, gripper_settle_done
         detection_sent = False
         waiting_for_next = False
         sent_time = None
@@ -798,16 +803,16 @@ def main():
         last_capture_vg = None
         last_tracking_send = 0.0
         last_sent_tracking_mm = None
-        last_smooth_cmd_mm = (
-            (chassis_x, chassis_y, last_smooth_cmd_mm[2])
-            if CHASSIS_ABSOLUTE_TARGET else (0, 0, 0)
-        )
+        last_smooth_cmd_mm = (chassis_x, chassis_y, last_smooth_cmd_mm[2])
         last_smooth_time = time.time()
-        cmd_vel_mm_s[0] = cmd_vel_mm_s[1] = 0.0
         last_kf_time = None
         last_valid_mm = (0, 0, 0)
         last_detected_center = None
         last_detection_time = None
+        # 每个新目标都重新等夹爪到位，避免沿用上一个目标已到位的状态
+        gripper_settle_target_mm = None
+        gripper_settle_started = None
+        gripper_settle_done = True
         recognition_started = False
         place_stable_count = 0
         place_last_center = None
@@ -886,60 +891,17 @@ def main():
         print("所有轮次完成，退出")
         return "done"
 
-    def smooth_tracking_cmd(cmd_mm, now, ff_vel_mm_s=None, absolute_target=False):
+    def smooth_tracking_cmd(cmd_mm, now):
         """
-        把目标移动量平滑成连续小步：
-        比例缩放 → 单包限幅 → 按 ramp 限制指令每帧变化量；
-        夹爪为绝对目标直发，不再做增量比例/ramp。
-        底盘指令不会从 0 突然跳到几十 mm，也不会在目标附近骤停。
-
-        ff_vel_mm_s: 速度前馈 (vx, vy) mm/s。传入时底盘每周期移动量 =
-            前馈速度×发送周期 + 位置误差×VFF_POSITION_GAIN，替代原比例增益。
-        absolute_target: True 时 x/y 直接作为“绝对目标位置”处理，
-            只做 ramp 平滑，不做增益/速度规划；夹爪本身始终是绝对伸长量直发。
+        把绝对目标指令平滑成连续小步：
+        x/y 是绝对目标位置（mm），按 ramp 限制每帧变化量；
+        夹爪为绝对伸长量直发，不做增量比例/ramp。
         """
         nonlocal last_smooth_cmd_mm, last_smooth_time
         x, y, gripper = cmd_mm
-        if absolute_target:
-            # 绝对目标模式：x/y 就是目标位置（mm），只做 ramp 平滑
-            dx = int(round(x))
-            dy = int(round(y))
-        elif ff_vel_mm_s is not None:
-            # 速度前馈：本周期期望位移 = 前馈速度 × 发送周期 + 位置修正
-            dt_cmd = TRACKING_SEND_INTERVAL if TRACKING_SEND_INTERVAL > 0 else 0.05
-            dx = int(max(-MAX_CHASSIS_STEP_MM, min(
-                MAX_CHASSIS_STEP_MM,
-                round(ff_vel_mm_s[0] * dt_cmd + x * VFF_POSITION_GAIN),
-            )))
-            dy = int(max(-MAX_CHASSIS_STEP_MM, min(
-                MAX_CHASSIS_STEP_MM,
-                round(ff_vel_mm_s[1] * dt_cmd + y * VFF_POSITION_GAIN),
-            )))
-        elif MOTION_PROFILE_ENABLED:
-            # 梯形速度规划：目标速度 = min(Vmax, sqrt(2*A*|误差|))，方向取误差方向。
-            # 误差大→加速，接近目标→速度按抛物线减速到 0，即“先加速后减速”。
-            dt_cmd = TRACKING_SEND_INTERVAL if TRACKING_SEND_INTERVAL > 0 else 0.05
-            for i, err in enumerate((x, y)):
-                if abs(err) > 1e-6:
-                    v_tgt = np.copysign(
-                        min(MOTION_PROFILE_MAX_VEL_MM_S,
-                            np.sqrt(2.0 * MOTION_PROFILE_ACCEL_MM_S2 * abs(err))),
-                        err,
-                    )
-                else:
-                    v_tgt = 0.0
-                dv = max(-MOTION_PROFILE_ACCEL_MM_S2 * dt_cmd,
-                         min(MOTION_PROFILE_ACCEL_MM_S2 * dt_cmd, v_tgt - cmd_vel_mm_s[i]))
-                cmd_vel_mm_s[i] += dv
-            dx = int(max(-MAX_CHASSIS_STEP_MM, min(
-                MAX_CHASSIS_STEP_MM, round(cmd_vel_mm_s[0] * dt_cmd))))
-            dy = int(max(-MAX_CHASSIS_STEP_MM, min(
-                MAX_CHASSIS_STEP_MM, round(cmd_vel_mm_s[1] * dt_cmd))))
-        else:
-            dx = int(max(-MAX_CHASSIS_STEP_MM,
-                         min(MAX_CHASSIS_STEP_MM, round(x * CHASSIS_P_GAIN))))
-            dy = int(max(-MAX_CHASSIS_STEP_MM,
-                         min(MAX_CHASSIS_STEP_MM, round(y * CHASSIS_P_GAIN))))
+        # 绝对目标模式：x/y 就是目标位置（mm），只做 ramp 平滑
+        dx = int(round(x))
+        dy = int(round(y))
 
         # ramp 按发送周期标定，这里按实际帧间隔缩放
         # 恢复/断帧后不允许一次性大步补回来：dt 最多按一个发送周期算，
@@ -949,12 +911,9 @@ def main():
         )
         dt = min(max(now - last_smooth_time, 0.0), smooth_dt_cap)
         if TRACKING_SEND_INTERVAL > 0:
-            chassis_ramp_step = (
-                VFF_RAMP_STEP_MM if ff_vel_mm_s is not None else CHASSIS_RAMP_STEP_MM
-            )
-            ramp = chassis_ramp_step * (dt / TRACKING_SEND_INTERVAL)
+            ramp = CHASSIS_RAMP_STEP_MM * (dt / TRACKING_SEND_INTERVAL)
         else:
-            ramp = VFF_RAMP_STEP_MM if ff_vel_mm_s is not None else CHASSIS_RAMP_STEP_MM
+            ramp = CHASSIS_RAMP_STEP_MM
         ramp = max(ramp, 0.5)
 
         lx, ly, lz = last_smooth_cmd_mm
@@ -969,6 +928,45 @@ def main():
         last_smooth_cmd_mm = (int(round(nx)), int(round(ny)), gz)
         last_smooth_time = now
         return last_smooth_cmd_mm
+
+    def update_gripper_settle(desired_mm, now, feedback_valid, fb_mm):
+        """
+        固定夹爪抓取前先等夹爪反馈到位，再允许底盘跟踪。
+        返回 True=已到位/不需要等待/超时；False=仍在等夹爪。
+        """
+        nonlocal gripper_settle_target_mm, gripper_settle_started, gripper_settle_done
+        if desired_mm is None:
+            gripper_settle_target_mm = None
+            gripper_settle_started = None
+            gripper_settle_done = True
+            return True
+
+        if (
+            feedback_valid
+            and abs(fb_mm - desired_mm) <= GRIPPER_SETTLE_TOLERANCE_MM
+        ):
+            gripper_settle_target_mm = desired_mm
+            gripper_settle_started = now
+            gripper_settle_done = True
+            return True
+
+        if gripper_settle_target_mm != desired_mm:
+            gripper_settle_target_mm = desired_mm
+            gripper_settle_started = now
+            gripper_settle_done = False
+            print(f"[夹爪] 等待夹爪到位 {desired_mm}mm，先不动底盘...")
+
+        if gripper_settle_done:
+            return True
+        if not feedback_valid:
+            # 没有串口反馈时无法判断，直接允许跟踪，避免离线/异常时卡住
+            gripper_settle_done = True
+            return True
+        if now - gripper_settle_started >= GRIPPER_SETTLE_TIMEOUT_S:
+            gripper_settle_done = True
+            print(f"[夹爪] 等待到位超时（{GRIPPER_SETTLE_TIMEOUT_S:.1f}s），继续底盘跟踪")
+            return True
+        return False
 
     def tracking_send_allowed(capture, cmd_mm):
         """
@@ -1312,12 +1310,12 @@ def main():
                                 tray_phase_active = True
                                 tray_order_label = (
                                     "倒序"
-                                    if TRAY_PHASE_ORDER in ("reverse", "reversed", "倒序")
+                                    if TRAY_PHASE_IS_REVERSE
                                     else "实际顺序"
                                 )
                                 tray_targets = (
                                     list(reversed(placed_order))
-                                    if TRAY_PHASE_ORDER in ("reverse", "reversed", "倒序")
+                                    if TRAY_PHASE_IS_REVERSE
                                     else list(placed_order)
                                 )
                                 # 进入阶段时一次算好每个托盘对应的物块颜色，
@@ -1541,7 +1539,7 @@ def main():
                         if placed_order:
                             tray_order = (
                                 ",".join(map(str, reversed(placed_order)))
-                                if TRAY_PHASE_ORDER in ("reverse", "reversed", "倒序")
+                                if TRAY_PHASE_IS_REVERSE
                                 else ",".join(map(str, placed_order))
                             )
                         else:
@@ -1689,6 +1687,9 @@ def main():
                             ):
                                 # 放置时夹爪固定（min/max/自定义 mm）：只调底盘
                                 gripper_mm = PLACE_GRIPPER_MM
+                            # 绝对目标：目标位置 = 回传位置 + 视觉误差
+                            chassis_x_mm = int(round(chassis_x + chassis_x_mm))
+                            chassis_y_mm = int(round(chassis_y + chassis_y_mm))
                             chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
                                 (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
                             )
@@ -2174,15 +2175,35 @@ def main():
                                     f"不在 {roi} 内，暂不抓取"
                                 )
 
-                            # 托盘阶段固定夹爪时：夹爪长度固定，只靠底盘把物块
-                            # 带到固定距离，避免“相机随夹爪伸缩 → 测量滞后 → 闭环震荡”。
+                            # 抓取区（含后续遍次）和非倒序托盘阶段复用第一次抓取的方式
+                            # （含 grab_gripper_fixed）；倒序托盘阶段保持原策略不变。
+                            # 夹爪长度固定后只靠底盘把物块带到固定距离，
+                            # 避免“相机随夹爪伸缩 → 测量滞后 → 闭环震荡”。
                             _tray_fixed_gripper = (
                                 tray_phase_active
                                 and (TRAY_GRIPPER_FIXED_CUSTOM
                                      or TRAY_GRIPPER_FIXED_MIN
                                      or TRAY_GRIPPER_FIXED_MAX)
                             )
-                            if _tray_fixed_gripper:
+                            # 倒序托盘阶段走原策略；其余（抓取区、后续遍次、
+                            # actual 托盘）都按第一次抓取的方式处理。
+                            _follow_first_grab = (
+                                not tray_phase_active or not TRAY_PHASE_IS_REVERSE
+                            )
+                            _follow_first_grab_fixed = (
+                                _follow_first_grab and GRAB_GRIPPER_FIXED_CUSTOM
+                            )
+                            if _follow_first_grab_fixed:
+                                track_gripper_cm = GRAB_GRIPPER_EXTEND_CM
+                                track_fixed_gripper_cm = (
+                                    transformer.min_jar_dis[1]
+                                    + GRAB_GRIPPER_EXTEND_CM
+                                )
+                            elif _follow_first_grab:
+                                # 第一次抓取未配置固定夹爪时同样动态调夹爪
+                                track_gripper_cm = current_gripper_cm
+                                track_fixed_gripper_cm = None
+                            elif _tray_fixed_gripper:
                                 if TRAY_GRIPPER_FIXED_CUSTOM:
                                     track_gripper_cm = TRAY_GRIPPER_EXTEND_CM
                                     track_fixed_gripper_cm = (
@@ -2199,6 +2220,25 @@ def main():
                                 track_gripper_cm = current_gripper_cm
                                 track_fixed_gripper_cm = None
 
+                            # 非倒序固定夹爪抓取：先等夹爪反馈到位，再允许底盘跟踪
+                            if _follow_first_grab_fixed:
+                                gripper_ready = update_gripper_settle(
+                                    GRAB_GRIPPER_MM,
+                                    time.time(),
+                                    chassis_data2 is not None,
+                                    fb_gripper_mm,
+                                )
+                            else:
+                                update_gripper_settle(
+                                    None, time.time(), True, 0.0
+                                )
+                                gripper_ready = True
+
+                            if not gripper_ready:
+                                # 夹爪还没到位：不允许请求抓取，也不动底盘
+                                would_capture = False
+                                capture = False
+
                             if KALMAN_WORLD_ENABLED:
                                 # 世界系：直接用卡尔曼输出的车中心系坐标(mm→cm)生成指令
                                 block_camera_coord = None
@@ -2212,54 +2252,53 @@ def main():
                                     )
                                 chassis_x_mm, chassis_y_mm, gripper_mm = cmd_mm
                                 if track_fixed_gripper_cm is not None:
-                                    gripper_mm = TRAY_GRIPPER_MM
-                                if CHASSIS_ABSOLUTE_TARGET:
-                                    # 绝对目标模式（像夹爪一样）：
-                                    # 目标位置 = 回传位置 + 视觉误差（可选加前瞻）
-                                    # x：把物块带到车中心线；y：把物块带到夹爪目标距离处
-                                    grab_dist_mm = (
-                                        transformer.min_jar_dis[1] * 10.0 + gripper_mm
+                                    gripper_mm = (
+                                        GRAB_GRIPPER_MM
+                                        if _follow_first_grab_fixed
+                                        else TRAY_GRIPPER_MM
                                     )
-                                    if CHASSIS_LOOKAHEAD_S > 0.0:
-                                        # 前瞻需要物块“地面速度”：
-                                        # use_chassis_velocity=true 时卡尔曼速度已是地面速度；
-                                        # false 时速度是相对车中心的速度，要补回底盘速度。
-                                        if KALMAN_WORLD_USE_CHASSIS_VEL:
-                                            la_vx, la_vy = fvx, fvy
-                                        else:
-                                            la_vx = fvx + chassis_vx
-                                            la_vy = fvy + chassis_vy
-                                        la_speed = np.hypot(la_vx, la_vy)
-                                        if la_speed > VFF_MAX_VEL_MM_S and la_speed > 1e-6:
-                                            k = VFF_MAX_VEL_MM_S / la_speed
-                                            la_vx *= k
-                                            la_vy *= k
-                                        target_fx = fx + la_vx * CHASSIS_LOOKAHEAD_S
-                                        target_fy = fy + la_vy * CHASSIS_LOOKAHEAD_S
+                                # 绝对目标模式（像夹爪一样）：
+                                # 目标位置 = 回传位置 + 视觉误差（可选加前瞻）
+                                # x：把物块带到车中心线；y：把物块带到夹爪目标距离处
+                                grab_dist_mm = (
+                                    transformer.min_jar_dis[1] * 10.0 + gripper_mm
+                                )
+                                if CHASSIS_LOOKAHEAD_S > 0.0:
+                                    # 前瞻需要物块“地面速度”：
+                                    # use_chassis_velocity=true 时卡尔曼速度已是地面速度；
+                                    # false 时速度是相对车中心的速度，要补回底盘速度。
+                                    if KALMAN_WORLD_USE_CHASSIS_VEL:
+                                        la_vx, la_vy = fvx, fvy
                                     else:
-                                        target_fx, target_fy = fx, fy
-                                    chassis_x_mm = int(round(chassis_x + target_fx))
-                                    chassis_y_mm = int(round(
-                                        chassis_y + (target_fy - grab_dist_mm)
-                                    ))
+                                        la_vx = fvx + chassis_vx
+                                        la_vy = fvy + chassis_vy
+                                    la_speed = np.hypot(la_vx, la_vy)
+                                    if (
+                                        la_speed > CHASSIS_LOOKAHEAD_MAX_SPEED_MM_S
+                                        and la_speed > 1e-6
+                                    ):
+                                        k = CHASSIS_LOOKAHEAD_MAX_SPEED_MM_S / la_speed
+                                        la_vx *= k
+                                        la_vy *= k
+                                    target_fx = fx + la_vx * CHASSIS_LOOKAHEAD_S
+                                    target_fy = fy + la_vy * CHASSIS_LOOKAHEAD_S
+                                else:
+                                    target_fx, target_fy = fx, fy
+                                chassis_x_mm = int(round(chassis_x + target_fx))
+                                chassis_y_mm = int(round(
+                                    chassis_y + (target_fy - grab_dist_mm)
+                                ))
+                                if not gripper_ready:
+                                    # 只发夹爪到位指令，底盘目标保持当前位置
+                                    chassis_x_mm = int(round(chassis_x))
+                                    chassis_y_mm = int(round(chassis_y))
+                                    gripper_mm = GRAB_GRIPPER_MM
                                 chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
                                     (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
                                 )
                                 desired_mm = (chassis_x_mm, chassis_y_mm, gripper_mm)
-                                # 前馈：世界系状态的速度就是物块地面速度（mm/s），
-                                # 不需要像素→mm 换算
-                                vff_vel = None
-                                if VFF_ENABLED:
-                                    vff_x, vff_y = fvx, fvy
-                                    vff_speed = np.hypot(vff_x, vff_y)
-                                    if vff_speed > VFF_MAX_VEL_MM_S and vff_speed > 1e-6:
-                                        k = VFF_MAX_VEL_MM_S / vff_speed
-                                        vff_x *= k
-                                        vff_y *= k
-                                    vff_vel = (vff_x, vff_y)
                                 chassis_x_mm, chassis_y_mm, gripper_mm = smooth_tracking_cmd(
-                                    desired_mm, time.time(), ff_vel_mm_s=vff_vel,
-                                    absolute_target=CHASSIS_ABSOLUTE_TARGET,
+                                    desired_mm, time.time()
                                 )
                                 last_valid_mm = (chassis_x_mm, chassis_y_mm, gripper_mm)
                             else:
@@ -2293,37 +2332,50 @@ def main():
                                         )
                                     chassis_x_mm, chassis_y_mm, gripper_mm = cmd_mm
                                     if track_fixed_gripper_cm is not None:
-                                        gripper_mm = TRAY_GRIPPER_MM
+                                        gripper_mm = (
+                                            GRAB_GRIPPER_MM
+                                            if _follow_first_grab_fixed
+                                            else TRAY_GRIPPER_MM
+                                        )
+                                    # 绝对目标：目标位置 = 回传位置 + 视觉误差
+                                    chassis_x_mm = int(round(chassis_x + chassis_x_mm))
+                                    chassis_y_mm = int(round(chassis_y + chassis_y_mm))
+                                    if not gripper_ready:
+                                        # 只发夹爪到位指令，底盘目标保持当前位置
+                                        chassis_x_mm = int(round(chassis_x))
+                                        chassis_y_mm = int(round(chassis_y))
+                                        gripper_mm = GRAB_GRIPPER_MM
                                     chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
                                         (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
                                     )
                                     desired_mm = (chassis_x_mm, chassis_y_mm, gripper_mm)
-                                    # 卡尔曼速度前馈：
-                                    # 物块世界速度 ≈ 底盘回传速度 - 图像视速度 / PX_PER_MM
-                                    # （近似垂直俯拍假设；带限速保护）
-                                    vff_vel = None
-                                    if (VFF_ENABLED and PX_PER_MM > 0
-                                            and FILTER_TYPE in ("kalman", "one_euro")):
-                                        vff_x = chassis_vx - fvx / PX_PER_MM
-                                        vff_y = chassis_vy - fvy / PX_PER_MM
-                                        vff_speed = np.hypot(vff_x, vff_y)
-                                        if vff_speed > VFF_MAX_VEL_MM_S and vff_speed > 1e-6:
-                                            k = VFF_MAX_VEL_MM_S / vff_speed
-                                            vff_x *= k
-                                            vff_y *= k
-                                        vff_vel = (vff_x, vff_y)
                                     chassis_x_mm, chassis_y_mm, gripper_mm = smooth_tracking_cmd(
-                                        desired_mm, time.time(), ff_vel_mm_s=vff_vel
+                                        desired_mm, time.time()
                                     )
                                     last_valid_mm = (chassis_x_mm, chassis_y_mm, gripper_mm)
                                 else:
                                     # 坐标无效时沿用上一帧有效指令，避免下位机误以为停止
                                     chassis_x_mm, chassis_y_mm, gripper_mm = last_valid_mm
                                     desired_mm = last_valid_mm
+                                    if not gripper_ready:
+                                        chassis_x_mm = int(round(chassis_x))
+                                        chassis_y_mm = int(round(chassis_y))
+                                        gripper_mm = GRAB_GRIPPER_MM
+                                        desired_mm = (
+                                            chassis_x_mm, chassis_y_mm, gripper_mm
+                                        )
                                     warn_invalid_coord(
                                         "抓取", target_x, target_y,
                                         frame.shape[1], frame.shape[0],
                                     )
+
+                            if not gripper_ready:
+                                cv2.putText(
+                                    frame,
+                                    f"Gripper settling {fb_gripper_mm:.0f}/{GRAB_GRIPPER_MM}mm",
+                                    (50, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    (0, 200, 255), 1,
+                                )
 
                             vg = VisionToGimbal(
                                 target=slot_index,
@@ -2391,12 +2443,10 @@ def main():
                         # 同步重置平滑状态，恢复识别后从 0 重新小步爬升，
                         # 避免用断帧前/后的陈旧时间差一次性补大步。
                         last_smooth_cmd_mm = (
-                            (chassis_x, chassis_y, last_smooth_cmd_mm[2])
-                            if CHASSIS_ABSOLUTE_TARGET else (0, 0, 0)
+                            chassis_x, chassis_y, last_smooth_cmd_mm[2]
                         )
                         last_smooth_time = time.time()
                         last_sent_tracking_mm = None
-                        cmd_vel_mm_s[0] = cmd_vel_mm_s[1] = 0.0
 
                         # 未检测到物块，显示提示
                         target_label = COLOR_LABEL_EN.get(

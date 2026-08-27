@@ -110,7 +110,7 @@ detection:
     sigma_x: 2
     sigma_y: 2
   circle:
-    min_radius: 30
+    min_radius: 35
     max_radius: 75
     min_area_factor: 0.2
   stability:

@@ -111942,3 +111942,54 @@ QR识别结果: ['3', '4', '5', '1', '3', '2', '4', '5', '3', '1', '2', '3']
 资源已释放
 ===== 程序退出 2026-08-28 01:31:08（本次运行 0:00:03.562064） =====
 日志中没有找到可解析的数据行
+
+===== 程序启动 2026-08-28 01:45:11 =====
+摄像头编号 1 直接打开失败，改用 /dev/video2
+摄像头已打开 (source: 1, 实际分辨率 640x480, 帧率 30.00fps)
+摄像头已打开 (source: 0, 实际分辨率 640x480, 帧率 30.50fps)
+串口已打开，底盘接收线程已启动
+[发送线程启动]，等待数据已发送启动信号 action=0，等待识别二维码...
+
+  capture=0 hex: 53 50 00 00 00 00 00 00 00 00 00 00 aa 66
+QR识别结果: ['3', '4', '5', '1', '3', '2', '4', '5', '3', '1', '2', '3']
+第 1 轮抓取顺序: ['3', '4', '5']，放置编号: ['1', '3', '2']（每轮重复 2 次）
+已发送抓取区移动指令，等待下位机 arrived=1 后开始识别物料
+识别到QR，关闭二维码USB摄像头
+[RX] chassis=(52,-53)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[状态] 底盘=(52,-53)mm gripper=0mm ack=0 fin=0 arr=0
+[识别] 开始抓取区识别（等待 arrived: 是）
+[RX] chassis=(118,-2)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[状态] 底盘=(171,-3)mm gripper=0mm ack=0 fin=0 arr=0
+[RX] chassis=(277,-5)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[RX] chassis=(410,-36)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[状态] 底盘=(446,-57)mm gripper=0mm ack=0 fin=0 arr=0
+[RX] chassis=(607,-10)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[RX] chassis=(758,43)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[状态] 底盘=(799,65)mm gripper=0mm ack=0 fin=0 arr=0
+[RX] chassis=(841,91)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[RX] chassis=(879,115)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[状态] 底盘=(877,114)mm gripper=0mm ack=0 fin=0 arr=0
+[RX] chassis=(0,0)mm v=(0,0)mm/s gripper=0mm ack=0 fin=0 arr=0
+[状态] 底盘=(0,0)mm gripper=0mm ack=0 fin=0 arr=0
+[状态] 底盘=(0,0)mm gripper=0mm ack=0 fin=0 arr=0
+[发送线程] 收到停止信号，退出
+[发送线程] 已退出
+资源已释放
+===== 程序退出 2026-08-28 01:45:20（本次运行 0:00:09.218067） =====
+/home/xu/Engineer/plot_log.py:147: UserWarning: No artists with labels found to put in legend.  Note that artists whose label start with an underscore are ignored when legend() is called with no argument.
+  ax.legend(loc="best")
+已保存: /home/xu/Engineer/log_plot.png  （解析 9 行）
+
+===== 程序启动 2026-08-28 01:46:51 =====
+摄像头编号 1 直接打开失败，改用 /dev/video2
+摄像头已打开 (source: 1, 实际分辨率 640x480, 帧率 30.00fps)
+摄像头已打开 (source: 0, 实际分辨率 640x480, 帧率 30.50fps)
+串口已打开，底盘接收线程已启动
+[发送线程启动]，等待数据已发送启动信号 action=0，等待识别二维码...
+
+  capture=0 hex: 53 50 00 00 00 00 00 00 00 00 00 00 aa 66
+[发送线程] 收到停止信号，退出
+[发送线程] 已退出
+资源已释放
+===== 程序退出 2026-08-28 01:47:14（本次运行 0:00:22.503605） =====
+日志中没有找到可解析的数据行

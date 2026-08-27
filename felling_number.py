@@ -81,19 +81,23 @@ class TinyCNN(nn.Module):
 
 # ===================== 模型加载 =====================
 
-def load_mnist_model(weight_path="/home/xu/Engineer/tiny_digit_cnn.pth"):
+def load_mnist_model(weight_path="/home/xu/Engineer/tiny_digit_cnn_3class.pth"):
     """
-    加载 MNIST 模型并返回 (model, device)
+    加载数字分类模型并返回 (model, device)。
+    自动根据权重中 fc 的输出维度确定类别数（10 分类或 3 分类均可）。
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = TinyCNN()
     state_dict = torch.load(weight_path, map_location=device)
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    num_classes = int(state_dict["fc.weight"].shape[0])
+    model = TinyCNN(num_classes=num_classes)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
-    print(f"模型已加载，设备: {device}")
+    print(f"模型已加载，设备: {device}，类别数: {num_classes}")
     return model, device
 
 
@@ -182,9 +186,10 @@ def preprocess_for_mnist(frame, target_size=28):
 
 # ===================== 推理 =====================
 
-def predict_digit(model, tensor, device):
+def predict_digit(model, tensor, device, class_labels=None):
     """
-    对预处理后的 tensor 进行推理，返回预测数字和置信度。
+    对预处理后的 tensor 进行推理，返回预测类别和置信度。
+    class_labels: 可选，把 argmax 索引映射为业务数字（如 3 分类时传 (1, 2, 3)）。
     """
     with torch.no_grad():
         tensor = tensor.to(device)
@@ -192,6 +197,8 @@ def predict_digit(model, tensor, device):
         prob = torch.softmax(output, dim=1)
         pred = torch.argmax(prob, dim=1).item()
         confidence = prob[0, pred].item()
+    if class_labels is not None:
+        pred = class_labels[pred]
     return pred, confidence
 
 
@@ -211,6 +218,7 @@ def usb_camera_recognition(
         return
 
     print("\n开始实时识别，按 'q' 退出，按 's' 截图保存\n")
+    digit_labels = (1, 2, 3) if model.fc.out_features == 3 else None
 
     try:
         while True:
@@ -234,7 +242,8 @@ def usb_camera_recognition(
 
             # 6. 推理
             if tensor is not None:
-                pred, conf = predict_digit(model, tensor, device)
+                pred, conf = predict_digit(model, tensor, device,
+                                           class_labels=digit_labels)
                 print(f"\r>>> 识别结果: {pred}  |  置信度: {conf:.3f}", end="")
 
                 # 在画面上标注结果

@@ -27,10 +27,11 @@
 ├── src.py                    # 主程序：QR → 物块识别追踪闭环
 ├── felling_number.py         # 手写数字识别（USB 实时 + TinyCNN）
 ├── model.py                  # TinyDigitCNN 模型定义（<25K 参数）
-├── tiny_digit_cnn.pth        # 数字识别训练权重
+├── tiny_digit_cnn_3class.pth # 数字识别训练权重（3分类：1~3）
 ├── hsv_tuner.py              # HSV 阈值实时调参工具
 ├── example_code.py           # 旧版整机程序（含物块/色环/码垛定标，遗留）
 ├── common_camera.py          # 双 USB 摄像头统一配置与打开
+├── camera_setup.py           # 摄像头角色配置工具（一次指定扫码/物块检测相机）
 ├── preprocessing.py          # 图像预处理（Otsu 二值化）
 ├── scan_QRcode_andlist.py    # QR 码扫描与目标序列解析
 ├── felling_color.py          # 物块颜色检测器（HSV 阈值 + 轮廓 + 稳定性判定）
@@ -54,7 +55,7 @@
 
 ## 一、主程序 `src.py` —— 物块识别追踪闭环
 
-### 工作流程（QR 4 组 → 2 轮，每轮“抓取→放置”重复 2 次）
+### 工作流程（QR 4 组 → 2 轮，每轮“抓取 → 放置区A → 托盘夹回 → 放置区B”）
 
 以二维码 `156+123+425+231` 为例，4 组数的含义：
 
@@ -63,12 +64,15 @@
 - 第 3 组：第 2 轮抓取颜色序列 `425`；
 - 第 4 组：第 2 轮放置编号 `231`。
 
-每轮“抓取 → 放置”完整执行 **2 遍**（`repeat=2`），即实际顺序为：
+每轮抓取 **1 次**（物块进入机器人后部 3 个槽位），然后到放置区 A 全部放到圆环，
+托盘阶段倒序夹回后部槽位，再带到放置区 B 全部放置，最后回抓取区抓下一轮：
 
 ```
-第 1 轮：156 抓取 → 123 放置 → 156 抓取 → 123 放置
-第 2 轮：425 抓取 → 231 放置 → 425 抓取 → 231 放置
+第 1 轮：156 抓取 → 放置区A(123) → 托盘夹回 → 放置区B(123) → 回抓取区
+第 2 轮：425 抓取 → 放置区A(231) → 托盘夹回 → 放置区B(231) → 结束
 ```
+
+`repeat=2` 表示每轮有 2 个放置区（A、B）；只有第 1 个放置区放完后执行托盘阶段。
 
 屏幕叠加显示仍保持二维码扫到的 4 组原始数字。
 
@@ -126,24 +130,30 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
    上位机进入托盘阶段：托盘队列按 `placement.tray_phase_order` 生成，
    `reverse`=倒序（默认），例如实际顺序 `2,1,3` → `[3,1,2]`；
    `actual`=按实际放置顺序，例如 `2,1,3` → `[2,1,3]`；
+   进入托盘阶段后，`tray_phase_arrived_mode=edge`（默认）时第一个托盘使用
+   放置完成后的 `arrived=1` 作为到达信号（第一个托盘即刚放置的位置时无需再等移动）；
+   `none` 时完全不等待 `arrived`，进入托盘阶段立即抓第一个、抓完立即下一个。
 2. 每个托盘按“放置槽位映射”反推出该托盘上的物块颜色，然后复用抓取阶段的
    视觉跟踪逻辑：颜色稳定后跟踪（`capture=0`），位置连续稳定 N 帧且
-   x 偏移 ≤ `grab_center_tolerance_px` 才发 `capture=1`；
+   x 偏移 ≤ `grab_center_tolerance_px` 才发 `capture=1`；`target` 发送的是该托盘
+   物块要放回的放置槽位（即 `slot_of_place_digit[托盘号]`，例如实际顺序 `2,1,3`、
+   放置序列 `132` 时倒序抓取 `3,1,2`，对应 `target=2,1,3`）；
    `tray_phase_order=reverse`（倒序）时夹爪按 `placement.tray_gripper_fixed` 原策略，
    `actual` 时与第一次抓取一样（配置了 `tracking.grab_gripper_fixed` 则固定夹爪先到位、
    再只靠底盘对准；未配置则动态调整）；
 3. 每次收到 `finish_capture=1` 后补发 `capture=0`，等下一次 `arrived` 0→1
    再开始下一个托盘；
 4. 最后一个托盘抓完后，下位机再发 `arrived` 时不再夹起，
-   直接进入下一遍/下一轮（`advance_after_placement_cycle`）。
+   直接前往下一个放置区/下一轮（`advance_after_placement_cycle`）。
 
 #### ⑥ 轮次重复与收尾
 
-- 本轮第 1 遍放完（3 个）：先执行托盘阶段，完成后 `round_cycles_done` 加 1，
-  清空 `placed_digits`，发送 `action=1` 回抓取区，等 `arrived=1` 后重复抓同一轮；
-- 本轮第 2 遍（最后一次）放完：**不执行托盘阶段**（不需要夹起），直接进入下一轮，
+- 放置区 A 放完（3 个）：先执行托盘阶段，把物块倒序夹回后部槽位，完成后
+  `round_cycles_done` 加 1，清空 `placed_digits`，发送 `action=2` 前往下一个放置区，
+  等 `arrived=1` 后再次全部放置（不再回抓取区）；
+- 放置区 B（本轮最后一次）放完：**不执行托盘阶段**（不需要夹起），直接进入下一轮，
   `current_round` 加 1、`round_cycles_done` 清零、
-  `target_colors` 换成下一轮抓取序列，发送 `action=1`，等 `arrived=1`；
+  `target_colors` 换成下一轮抓取序列，发送 `action=1` 回抓取区，等 `arrived=1`；
 - 两轮全部完成 → 打印“所有轮次完成，退出”，退出主循环并释放资源
   （摄像头、串口接收线程、串口）。
 
@@ -166,17 +176,19 @@ flowchart TD
     SKIP -- "否" --> GO_GRAB1["发 action=1，等 arrived=1"]
     GO_GRAB1 --> GRAB1["第1轮第1次抓取：第1组颜色"]
     GRAB1 --> GO_PLACE["发 action=2，等 arrived=1"]
-    GO_PLACE --> PLACE1["第1轮第1次放置：第2组数字"]
+    GO_PLACE --> PLACE1["第1轮 放置区A：第2组数字"]
     GO_PLACE1 --> PLACE1
-    PLACE1 --> REP1{"第1轮已重复 2 次？"}
-    REP1 -- "否" --> GO_GRAB1
-    REP1 -- "是" --> GO_GRAB2["发 action=1，等 arrived=1"]
+    PLACE1 --> TRAY1["托盘阶段：倒序夹回后部槽位"]
+    TRAY1 --> GO_PLACE2["发 action=2 前往放置区B，等 arrived=1"]
+    GO_PLACE2 --> PLACE2["第1轮 放置区B：第2组数字"]
+    PLACE2 --> GO_GRAB2["发 action=1，等 arrived=1"]
     GO_GRAB2 --> GRAB2["第2轮第1次抓取：第3组颜色"]
-    GRAB2 --> GO_PLACE2["发 action=2，等 arrived=1"]
-    GO_PLACE2 --> PLACE2["第2轮第1次放置：第4组数字"]
-    PLACE2 --> REP2{"第2轮已重复 2 次？"}
-    REP2 -- "否" --> GO_GRAB2
-    REP2 -- "是" --> DONE["全部完成，退出"]
+    GRAB2 --> GO_PLACE3["发 action=2，等 arrived=1"]
+    GO_PLACE3 --> PLACE3["第2轮 放置区A：第4组数字"]
+    PLACE3 --> TRAY2["托盘阶段：倒序夹回后部槽位"]
+    TRAY2 --> GO_PLACE4["发 action=2 前往放置区B，等 arrived=1"]
+    GO_PLACE4 --> PLACE4["第2轮 放置区B：第4组数字"]
+    PLACE4 --> DONE["全部完成，退出"]
 ```
 
 > 串口发送由独立后台线程 `Sending2Gimbal` 完成：主循环把 `VisionToGimbal` 数据包放入队列，
@@ -325,7 +337,7 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `placement.model_path` | `/home/xu/Engineer/tiny_digit_cnn.pth` | 数字识别模型路径 |
+| `placement.model_path` | `/home/xu/Engineer/tiny_digit_cnn_3class.pth` | 数字识别模型路径（3分类） |
 | `placement.gripper_fixed` | `min` | 放置时夹爪固定策略：`min`=固定最短（0mm 伸长）只调底盘；`max`=固定最长（84mm 伸长）只调底盘；`dynamic`=与抓取一样动态调夹爪（旧配置 `gripper_fixed_max` 仍兼容） |
 | `placement.gripper_fixed_mm` | `null` | 自定义固定伸长量（mm），非空时优先生效；例如 `40`=固定伸长 40mm 只调底盘 |
 | `placement.debug` | `false` | `true` 时打印圆环/数字识别调试日志（约 1 秒 1 条） |
@@ -344,6 +356,7 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `placement.placement_order_log` | `./placement_order.log` | 放置顺序记录文件路径（追加写入，含时间戳） |
 | `placement.tray_phase_enabled` | `true` | `true` 时放置完成后进入托盘阶段（抓取托盘上的物块） |
 | `placement.tray_phase_order` | `reverse` | 托盘阶段抓取顺序：`reverse`=倒序（默认），`actual`=按实际放置顺序 |
+| `placement.tray_phase_arrived_mode` | `edge` | 托盘阶段 arrived 处理：`edge`=逐托盘等 0→1 上升沿（默认，第一个托盘使用放置完成后的 `arrived=1`）；`none`=不等待 arrived，进入即抓、抓完立即下一个（下位机 arrived 持续为 1 时用） |
 | `placement.tray_phase_action` | `1` | 托盘阶段动作码（默认 1=抓取），保留兼容 |
 | `placement.tray_phase_capture` | `true` | 已由视觉跟踪取代：托盘阶段 capture 由位置稳定+对准决定 |
 | `placement.tray_phase_skip_last_of_round` | `true` | `true` 时每轮最后一次放置不需要夹起，直接进入下一轮 |
@@ -375,12 +388,13 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 
 ### 串口协议
 
-#### 上位机 → 云台（VisionToGimbal，13 字节）
+#### 上位机 → 云台（VisionToGimbal，14 字节）
 
 | 字段 | 字节 | 类型 | 说明 |
 |---|---|---|---|
 | head | 2B | uint8×2 | `0x53 0x50` |
 | target | 1B | uint8 | 0=任务开始/区域移动, 1~3=物块槽位号 |
+| number | 1B | uint8 | 当前识别到的数字（放置阶段=圆环数字，其他阶段=0） |
 | action | 1B | uint8 | 0=启动/空闲, 1=抓取, 2=放置 |
 | capture | 1B | uint8 | 0=跟踪/移动中, 1=执行动作（抓取或松爪放置） |
 | chassis_x | 2B | int16 | 底盘左右移动量（mm，正=左，负=右） |
@@ -468,8 +482,8 @@ src.py
 
 ## 二、手写数字识别 `felling_number.py`
 
-USB 物块检测相机实时采集 + 轻量 CNN（MNIST）数字识别，模型定义在 `model.py`
-（`TinyDigitCNN`，深度可分离卷积思路，参数量 < 25K，训练权重 `tiny_digit_cnn.pth`）。
+USB 物块检测相机实时采集 + 轻量 CNN 数字识别（1~3），模型定义在 `model.py`
+（`TinyDigitCNN`，深度可分离卷积思路，参数量 < 25K，当前训练权重 `tiny_digit_cnn_3class.pth`）。
 
 预处理流水线：
 
@@ -483,7 +497,7 @@ USB 物块检测相机实时采集 + 轻量 CNN（MNIST）数字识别，模型�
 
 ```mermaid
 flowchart TD
-    A["加载模型 TinyCNN<br/>tiny_digit_cnn.pth"] --> B["打开物块检测 USB 相机<br/>open_camera"]
+    A["加载模型 TinyCNN<br/>tiny_digit_cnn_3class.pth"] --> B["打开物块检测 USB 相机<br/>open_camera"]
     B --> C["读取一帧 read_frame"]
     C --> D["转灰度 → 高斯模糊 → OTSU反二值<br/>闭运算 → 最大轮廓定位"]
     D --> E["20×20 等比缩放 → 28×28 居中<br/>MNIST标准化"]
@@ -557,8 +571,13 @@ python3 calibrate_camera.py --cols 9 --rows 6 --square-mm 25 --min-images 10 --u
 > 只有换算后已到车中心后方的点才判无效。当前相机为垂直向下安装，
 > `CAMERA_PITCH_DEG` 已设为 `90.0`。
 
-> 双 USB 摄像头的设备编号/路径统一在 `common_camera.py` 顶部配置：
-> `QR_CAMERA_SOURCE = 0`（二维码相机）、`DETECTION_CAMERA_SOURCE = 1`（物块检测相机）。
+> 双 USB 摄像头默认在 `common_camera.py` 顶部配置（`QR_CAMERA_SOURCE`、
+> `DETECTION_CAMERA_SOURCE`）。推荐运行 `python3 camera_setup.py`：
+> 逐个预览摄像头画面，按 `Q` 指定为二维码相机、按 `D` 指定为物块检测相机，
+> 结果写入 `camera_roles.json`，之后无需再改代码。
+> 插拔顺序导致编号互换时重跑一次即可；若想彻底固定，运行
+> `python3 camera_setup.py --udev`，按提示安装 udev 规则后，
+> 摄像头会固定映射为 `/dev/video_qr`、`/dev/video_detect`，插拔/重启顺序都不再影响。
 > 物块检测相机默认请求 `640x480`（`DETECTION_FRAME_WIDTH/HEIGHT`），若相机支持更高分辨率，
 > 改这里并用同一分辨率重新标定。
 > 如果系统里摄像头编号不是 0/1，用 `ls /dev/video*` 或

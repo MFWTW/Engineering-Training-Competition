@@ -64,6 +64,8 @@ class PlacementRecognizer:
         if model_path is None:
             model_path = MODEL_PATH
         self.model, self.device = load_mnist_model(model_path)
+        # 3 分类模型输出索引 0/1/2，映射回业务数字 1/2/3
+        self.class_labels = (1, 2, 3) if self.model.fc.out_features == 3 else None
         self.last_ring_debug = {
             "contours": 0,
             "area_rejected": 0,
@@ -71,10 +73,12 @@ class PlacementRecognizer:
             "radius_rejected": 0,
         }
 
-    def find_rings(self, gray):
+    def find_rings(self, gray, roi=None):
         """
         在灰度图中找出所有同心圆环组，返回每组最内层圆环：
         [{"center": (x, y), "radius": r, "contour": cnt}, ...]
+
+        roi: [x, y, w, h]，非 None 时只保留圆心在该区域内的圆环（坐标仍为全图坐标）。
         """
         _, binary = cv2.threshold(
             gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
@@ -123,6 +127,16 @@ class PlacementRecognizer:
 
         if not candidates:
             return []
+
+        if roi is not None:
+            rx, ry, rw, rh = (int(v) for v in roi)
+            candidates = [
+                c for c in candidates
+                if rx <= c["center"][0] <= rx + rw
+                and ry <= c["center"][1] <= ry + rh
+            ]
+            if not candidates:
+                return []
 
         # 同心圆环按中心距离分组，每组取半径最小的（最内层圆环）
         candidates.sort(key=lambda c: c["radius"])
@@ -179,15 +193,19 @@ class PlacementRecognizer:
         if tensor is None:
             return None
 
-        digit, confidence = predict_digit(self.model, tensor, self.device)
+        digit, confidence = predict_digit(
+            self.model, tensor, self.device, class_labels=self.class_labels
+        )
         if SHOW_DEBUG:
             self.last_digit_crop = roi_masked
             self.last_digit_canvas = debug_canvas
         return digit, float(confidence), debug_canvas
 
-    def recognize_all(self, frame):
+    def recognize_all(self, frame, roi=None):
         """
         识别一帧放置区画面的所有圆环（含数字识别结果）。
+
+        roi: [x, y, w, h]，非 None 时只识别圆心在该区域内的圆环。
 
         返回:
             [{"center", "radius", "contour", "digit", "confidence"}, ...]
@@ -200,7 +218,7 @@ class PlacementRecognizer:
         else:
             gray = frame
 
-        rings = self.find_rings(gray)
+        rings = self.find_rings(gray, roi=roi)
         all_rings = []
         for ring in rings:
             item = dict(ring)
@@ -279,9 +297,9 @@ class PlacementRecognizer:
                           f"（检查数字是否完整在圆环中心、裁剪是否合适）")
         return all_rings
 
-    def recognize(self, frame):
+    def recognize(self, frame, roi=None):
         """兼容旧接口：只返回数字识别通过的圆环。"""
         return [
-            r for r in self.recognize_all(frame)
+            r for r in self.recognize_all(frame, roi=roi)
             if r["digit"] is not None
         ]

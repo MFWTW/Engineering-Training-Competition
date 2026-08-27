@@ -5,19 +5,21 @@ import time
 import logging
 from typing import List, Optional
 
-# 小端: head(2B) target(1B) action(1B) capture(1B)
+# 小端: head(2B) target(1B) number(1B) action(1B) capture(1B)
 #       chassis_x(2B) chassis_y(2B) gripper(2B) tail(2B)
-PACK_FORMAT = "<2B B B B h h H 2B"
-PACK_SIZE = struct.calcsize(PACK_FORMAT)  # 13 字节
+PACK_FORMAT = "<2B B B B B h h H 2B"
+PACK_SIZE = struct.calcsize(PACK_FORMAT)  # 14 字节
 
 logger = logging.getLogger("Gimbal")
 
 
 class VisionToGimbal:
     def __init__(self, target: int = 0, action: int = 0, capture: bool = False,
+                 number: int = 0,
                  chassis_x_mm: int = 0, chassis_y_mm: int = 0, gripper_mm: int = 0):
         self.head: bytes = b"\x53\x50"
         self.target_: int = target          # uint8_t, 0~255
+        self.number_: int = int(number)     # uint8_t, 当前识别到的数字（放置阶段=圆环数字，其他=0）
         self.action_: int = int(action)     # uint8_t, 0=启动/空闲, 1=抓取, 2=放置
         self.capture_: int = 1 if capture else 0  # uint8_t, 0=跟踪中/未抓取, 1=请求抓取
         self.chassis_x_mm: int = int(chassis_x_mm)  # int16_t，底盘左右移动量，正=左，负=右
@@ -26,19 +28,21 @@ class VisionToGimbal:
         self.tail: bytes = b"\xAA\x66"
 
     def pack(self) -> bytes:
-        """序列化二进制：head + target + action + capture + 底盘/夹爪 + tail"""
+        """序列化二进制：head + target + number + action + capture + 底盘/夹爪 + tail"""
         capture = 1 if self.capture_ else 0
         data = struct.pack(
             PACK_FORMAT,
             self.head[0], self.head[1],
             self.target_,
+            self.number_,
             self.action_,
             capture,
             self.chassis_x_mm, self.chassis_y_mm, self.gripper_mm,
             self.tail[0], self.tail[1]
         )
         logger.info(
-            f"[发送包] target={self.target_} action={self.action_} capture={capture} "
+            f"[发送包] target={self.target_} number={self.number_} "
+            f"action={self.action_} capture={capture} "
             f"chassis=({self.chassis_x_mm},{self.chassis_y_mm})mm "
             f"gripper={self.gripper_mm}mm "
             f"hex={data.hex(' ')} len={len(data)}"

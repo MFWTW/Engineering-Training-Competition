@@ -1,5 +1,8 @@
 import cv2
 import numpy as np
+import os
+import subprocess
+import sys
 import threading
 import time
 import queue
@@ -140,6 +143,33 @@ DISPLAY_MAX_HEIGHT = float(_cfg("display", "max_height", default=540))
 # 画面左下角叠加显示串口收发信息（只显示英文/数字，避免 OpenCV 中文乱码）
 SERIAL_OVERLAY_ENABLED = bool(_cfg("display", "serial_overlay", "enabled", default=True))
 SERIAL_OVERLAY_MAX = int(_cfg("display", "serial_overlay", "max_lines", default=4))
+
+# 外接屏大字显示扫码结果（qr_display.py，config.yaml → display.qr_display）
+# display 留空 = 继承本程序当前的 DISPLAY（一般即用户正在看的桌面，最稳妥）；
+# 只有确实要显示到另一个 X 会话（如物理外接屏）时才填具体值，并配合 xauthority。
+QR_DISPLAY_ENABLED = bool(_cfg("display", "qr_display", "enabled", default=True))
+QR_DISPLAY_DISPLAY = str(
+    _cfg("display", "qr_display", "display", default="") or ""
+).strip()
+QR_DISPLAY_XAUTHORITY = str(
+    _cfg("display", "qr_display", "xauthority", default="") or ""
+).strip()
+QR_DISPLAY_MONITOR = _cfg("display", "qr_display", "monitor", default=None)
+QR_DISPLAY_STATE_FILE = str(
+    _cfg("display", "qr_display", "state_file",
+         default="/tmp/qr_display_result.txt")
+    or "/tmp/qr_display_result.txt"
+)
+QR_DISPLAY_LOG_FILE = str(
+    _cfg("display", "qr_display", "log_file",
+         default="/tmp/qr_display.log")
+    or "/tmp/qr_display.log"
+)
+# true=启动时若检测到旧的显示进程（如上次运行遗留），先请其退出再接管，
+# 避免旧进程占着单实例锁导致新的显示窗口一直起不来
+QR_DISPLAY_REPLACE = bool(_cfg("display", "qr_display", "replace", default=True))
+if not os.environ.get("QR_DISPLAY_FILE"):
+    os.environ["QR_DISPLAY_FILE"] = QR_DISPLAY_STATE_FILE
 
 # 画面显示用英文颜色名（OpenCV 默认字体不支持中文，中文会显示乱码）
 COLOR_LABEL_EN = {
@@ -634,6 +664,100 @@ def Sending2Gimbal(data_pack, serial_comm):
     print("[发送线程] 已退出")
 
 
+_QR_DISPLAY_PROC = None
+
+
+def _read_log_tail(path, n=8):
+    """读取文件末尾若干行，用于显示进程启动失败时的诊断输出。"""
+    try:
+        lines = Path(path).read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        return lines[-n:]
+    except OSError:
+        return []
+
+
+def _start_qr_display(reset_state=False):
+    """自动拉起外接屏显示进程；已在运行时不重复启动。
+
+    reset_state=True 时清空状态文件，让外接屏先显示“等待扫码...”
+    （只在 src.py 启动时调用；扫码命中时传 False，保留刚写入的结果）。
+
+    显示进程用独立会话（setsid）+ 忽略 SIGHUP + 输出重定向到日志启动，
+    关闭本程序/终端不会关闭显示窗口。
+    """
+    global _QR_DISPLAY_PROC
+    if not QR_DISPLAY_ENABLED:
+        return
+    if _QR_DISPLAY_PROC is not None and _QR_DISPLAY_PROC.poll() is None:
+        return
+
+    script = Path(__file__).resolve().parent / "qr_display.py"
+    state_file = os.environ.get("QR_DISPLAY_FILE", "/tmp/qr_display_result.txt")
+    if reset_state:
+        try:
+            os.unlink(state_file)
+        except OSError:
+            pass
+    cmd = [sys.executable, str(script), "--file", state_file]
+    if QR_DISPLAY_REPLACE:
+        cmd.append("--replace")
+    if QR_DISPLAY_MONITOR is not None:
+        cmd += ["--monitor", str(int(QR_DISPLAY_MONITOR))]
+
+    env = os.environ.copy()
+    if QR_DISPLAY_DISPLAY:
+        env["DISPLAY"] = QR_DISPLAY_DISPLAY
+    if QR_DISPLAY_XAUTHORITY:
+        env["XAUTHORITY"] = QR_DISPLAY_XAUTHORITY
+
+    log_fd = None
+    try:
+        log_fd = open(QR_DISPLAY_LOG_FILE, "a", encoding="utf-8")
+    except OSError as exc:
+        print(f"[QR显示] 无法打开显示进程日志 {QR_DISPLAY_LOG_FILE}: {exc}")
+
+    try:
+        _QR_DISPLAY_PROC = subprocess.Popen(
+            cmd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd if log_fd is not None else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as exc:
+        _QR_DISPLAY_PROC = None
+        print(f"[QR显示] 外接屏显示进程启动失败: {exc}")
+        return
+    finally:
+        if log_fd is not None:
+            log_fd.close()
+
+    print(f"[QR显示] 已启动外接屏显示进程 (pid={_QR_DISPLAY_PROC.pid})")
+    if QR_DISPLAY_DISPLAY:
+        print(f"[QR显示] 使用 DISPLAY={QR_DISPLAY_DISPLAY}")
+    if QR_DISPLAY_XAUTHORITY:
+        print(f"[QR显示] 使用 XAUTHORITY={QR_DISPLAY_XAUTHORITY}")
+    print(f"[QR显示] 监视扫码结果文件: {state_file}（日志: {QR_DISPLAY_LOG_FILE}）")
+
+    # 等约 1 秒确认显示进程没有“启动即退出”（常见原因：DISPLAY 连不上、
+    # 旧的单实例锁未释放、tkinter 异常），退出时把日志尾巴打出来方便排查。
+    time.sleep(1.0)
+    if _QR_DISPLAY_PROC.poll() is not None:
+        print(
+            f"[QR显示] 警告：显示进程启动后立即退出 "
+            f"(pid={_QR_DISPLAY_PROC.pid}, exit={_QR_DISPLAY_PROC.returncode})"
+        )
+        tail = _read_log_tail(QR_DISPLAY_LOG_FILE)
+        if tail:
+            print("[QR显示] 显示进程日志（最后几行）：")
+            for line in tail:
+                print(f"  {line}")
+
+
 # ==================== 主程序 ====================
 def main():
     global C_1, C_2, chassis_x, chassis_y, chassis_vx, chassis_vy
@@ -682,6 +806,7 @@ def main():
     vg = VisionToGimbal(target=0, action=IDLE_ACTION)
     enqueue_latest(q, vg)
     print("已发送启动信号 action=0，等待识别二维码...")
+    _start_qr_display(reset_state=True)
 
     # ---- 状态 ----
     last_sessions = None
@@ -721,6 +846,7 @@ def main():
     waiting_for_next = False    # 已请求抓取，等待下位机 finish_capture 或手动切换
     all_done = False            # 所有目标已完成，退出主循环
     rounds = []                 # [{"grab": [...], "place": [...]}, ...]
+    round_digit_of_color = []   # 每轮 "颜色代码→圆环数字" 映射（供下一轮遮挡反推）
     current_round = 0
     round_cycles_done = 0       # 当前轮已完成几遍“抓取→放置”（0 开始，每轮 repeat 次）
     phase = IDLE_ACTION         # 当前动作：0=启动/空闲，1=抓取，2=放置
@@ -839,17 +965,22 @@ def main():
         kwf.reset()
         one_euro_tracker.reset()
 
-    def advance_after_placement_cycle():
+    def advance_after_placement_cycle(already_at_next_area=False):
         """一次放置完成后推进流程：
         - 第 1 次放置（托盘阶段已把物块夹回后部槽位）：直接前往下一个放置区；
         - 第 2 次（本轮最后一次）放置：进下一轮或结束。
 
-        返回 "done" 表示所有轮次完成，否则已发出区域移动指令。
+        already_at_next_area=True 时（托盘阶段结束收到的 arrived=1 已经是
+        “到达下一放置区”的信号），不再重发 action=2、不再等新的上升沿，
+        直接进入放置识别。
+
+        返回 "done" 表示所有轮次完成，否则流程已推进。
         """
         nonlocal round_cycles_done, current_round, target_colors, target_index
         nonlocal placed_digits, placed_order, place_waiting_arrived
-        nonlocal waiting_for_arrive, phase_after_arrival, prev_arrived
-        nonlocal placed_block_slots
+        nonlocal waiting_for_arrive, phase, phase_after_arrival, prev_arrived
+        nonlocal placed_block_slots, slot_of_place_digit
+        nonlocal last_placed_digit, placement_recognizer
 
         repeat = rounds[current_round].get("repeat", 1)
         if round_cycles_done + 1 < repeat:
@@ -867,14 +998,35 @@ def main():
             # 不再回抓取区，直接前往下一个放置区再次全部放置。
             placed_block_slots.clear()
             place_waiting_arrived = False
-            print(f"第 {current_round + 1} 轮第 {round_cycles_done} 次放置完成，"
-                  f"前往下一个放置区（物块已夹回后部槽位）")
-            vg = VisionToGimbal(target=0, action=PLACE_ACTION)
-            enqueue_latest(q, vg)
-            waiting_for_arrive = True
-            phase_after_arrival = PLACE_ACTION
-            prev_arrived = 0
-            reset_action_state()
+            if already_at_next_area:
+                # 临时绕过：下位机在托盘阶段结束后已经自行驶到下一个放置区，
+                # 并且刚回 arrived=1。这个 1 直接当作“已到达放置区 B”的信号，
+                # 不再重发 action=2（否则下位机可能再走一段且 arrived 不掉 0，
+                # 上位机永远等不到新的 0→1 上升沿）。
+                print(f"第 {current_round + 1} 轮第 {round_cycles_done} 次放置完成，"
+                      f"已到达下一个放置区（物块已夹回后部槽位）")
+                waiting_for_arrive = False
+                phase = PLACE_ACTION
+                phase_after_arrival = PLACE_ACTION
+                prev_arrived = 1
+                reset_action_state()
+                last_placed_digit = None
+                slot_of_place_digit = {
+                    int(d): i + 1
+                    for i, d in enumerate(rounds[current_round]["place"])
+                }
+                if placement_recognizer is None:
+                    placement_recognizer = PlacementRecognizer()
+                print("已到达放置区，开始识别物料（圆环数字）")
+            else:
+                print(f"第 {current_round + 1} 轮第 {round_cycles_done} 次放置完成，"
+                      f"前往下一个放置区（物块已夹回后部槽位）")
+                vg = VisionToGimbal(target=0, action=PLACE_ACTION)
+                enqueue_latest(q, vg)
+                waiting_for_arrive = True
+                phase_after_arrival = PLACE_ACTION
+                prev_arrived = 0
+                reset_action_state()
             return "place"
 
         if current_round + 1 < len(rounds):
@@ -1046,6 +1198,7 @@ def main():
                 if sessions and sessions != last_sessions:
                     last_sessions = sessions
                     print(f"QR识别结果: {sessions}")
+                    _start_qr_display()
 
                     # 4 组数解析为两轮任务：[抓取序列, 放置序列] × 2
                     groups = scan_QRcode_andlist.groups
@@ -1064,6 +1217,23 @@ def main():
                     if not rounds:
                         print("[QR] 无法解析抓取/放置序列，退出")
                         break
+
+                    # 每轮按“槽位”关系建立 颜色→圆环数字 映射：
+                    # 第 n 轮放在圆环数字 d 上的物块颜色 = 槽位与 d 相同的抓取颜色。
+                    round_digit_of_color = []
+                    for rnd in rounds:
+                        r_slot_of_color = {
+                            c: i + 1 for i, c in enumerate(rnd["grab"])
+                        }
+                        r_slot_of_digit = {
+                            int(d): i + 1 for i, d in enumerate(rnd["place"])
+                        }
+                        r_digit_of_color = {}
+                        for r_digit, r_slot in r_slot_of_digit.items():
+                            for r_color, r_cslot in r_slot_of_color.items():
+                                if r_cslot == r_slot:
+                                    r_digit_of_color[r_color] = r_digit
+                        round_digit_of_color.append(r_digit_of_color)
 
                     current_round = 0
                     round_cycles_done = 0
@@ -1415,6 +1585,19 @@ def main():
                             print("本槽放置完成，等待下位机到达下一个放置位置（arrived=1）")
                             continue
 
+                # 下位机还没回 arrived=1（0→1 到达信号）时：
+                # 不识别、不发送跟踪/抓取指令，避免车还没到位就提前动作。
+                # 放置阶段原本有自己的拦截，这里统一补上抓取等阶段的拦截。
+                if waiting_for_arrive:
+                    if frame is not None:
+                        cv2.putText(frame, "Waiting for arrived=1 ...",
+                                    (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                    (0, 255, 255), 2)
+                    show_detection(frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                    continue
+
                 # ==================== 托盘阶段（按配置顺序抓取托盘上的物块） ====================
                 # 复用抓取阶段的视觉跟踪逻辑：按托盘对应物块颜色识别、
                 # 动态调夹爪，位置稳定且对准后才发 capture=1。
@@ -1460,11 +1643,13 @@ def main():
                         tray_pending_digit = None
                         tray_pending_slot = None
                         print("托盘阶段完成，前往下一个放置区/下一轮")
-                        result = advance_after_placement_cycle()
-                        # 当前 arrived=1 只是最后一个托盘动作结束后的电平
-                        # （capture=0 后下位机把 arrived 拉回 1），不是“已到达下一区域”。
-                        # advance 内部会把 prev_arrived 置 0，这里再置 1 吞掉它，
-                        # 等下位机真正驶向放置区B/抓取区（arr 掉 0）再到位（arr 升 1）触发。
+                        # 临时绕过：这个 arrived 0→1 直接当作“已到达下一个放置区”，
+                        # advance 不再重发 action=2、不再等新的上升沿。
+                        # 若流程实际是进下一轮抓取区（already_at_next_area 不生效），
+                        # advance 仍会发 action=1 并等新的 0→1，这里再置 1 吞掉旧电平。
+                        result = advance_after_placement_cycle(
+                            already_at_next_area=True
+                        )
                         prev_arrived = 1
                         if result == "done":
                             all_done = True
@@ -1642,9 +1827,18 @@ def main():
                                     (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                     (0, 255, 255), 2)
 
-                        # 与抓取阶段一致：只识别检测 ROI 内的圆环
+                        # 与抓取阶段一致：只识别检测 ROI 内的圆环。
+                        # 圆环数字被上一轮留在放置区的物块遮挡时
+                        # （第 2 轮放置区 B），按圆环上物块颜色反推数字。
+                        prev_digit_of_color = (
+                            round_digit_of_color[current_round - 1]
+                            if current_round > 0
+                            and current_round - 1 < len(round_digit_of_color)
+                            else None
+                        )
                         all_rings = placement_recognizer.recognize_all(
-                            frame, roi=detector.detection_area
+                            frame, roi=detector.detection_area,
+                            digit_of_color=prev_digit_of_color,
                         )
 
                         # 所有检测到的圆环都画到主画面上，方便看识别情况
@@ -1656,6 +1850,8 @@ def main():
                             label = str(ring["digit"]) if ring["digit"] is not None else "?"
                             conf_txt = (f"{ring['confidence']:.2f}"
                                         if ring["digit"] is not None else "")
+                            if ring.get("inferred_by_color"):
+                                conf_txt += f" C{ring.get('color_code', '?')}"
                             cv2.putText(frame, f"{label} {conf_txt}",
                                         (rx - 30, ry - rr - 8),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -1852,8 +2048,13 @@ def main():
                                 ring_cx - w_img // 2,
                                 ring_cy - h_img // 2,
                             )
+                            infer_txt = (
+                                "（颜色推断）"
+                                if target.get("inferred_by_color") else ""
+                            )
                             print(
-                                f"圆环数字 {digit} 已对准(x偏移={cur_offset}px, "
+                                f"圆环数字 {digit} 已对准{infer_txt}"
+                                f"(x偏移={cur_offset}px, "
                                 f"y偏移={cur_y_offset}px, "
                                 f"图像中心距离={place_dist:.0f}px)，"
                                 f"放置槽位 {slot_index} 的物块"
@@ -2567,6 +2768,15 @@ def main():
     finally:
         enqueue_latest(q, None)
         sending_thread.join(timeout=2)
+
+        if (
+            _QR_DISPLAY_PROC is not None
+            and _QR_DISPLAY_PROC.poll() is None
+        ):
+            print(
+                f"[QR显示] 外接屏显示进程保持运行 "
+                f"(pid={_QR_DISPLAY_PROC.pid})，关闭本程序不影响显示"
+            )
 
         if cap and cap.isOpened():
             cap.release()

@@ -13,6 +13,7 @@ import yaml
 from pathlib import Path
 
 from felling_number import load_mnist_model, preprocess_for_mnist, predict_digit
+from felling_color import CODE_TO_KEY, build_color_masks
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
@@ -43,6 +44,13 @@ MORPH_KERNEL_SIZE = int(_PLACE_CFG.get("morph_kernel_size", 5))  # 闭运算核�
 MIN_CROP_PX = _place_float("min_crop_px", 12)                 # 数字裁剪最小半径（px）
 DEBUG = bool(_PLACE_CFG.get("debug", False))                  # true=打印识别调试日志
 SHOW_DEBUG = bool(_PLACE_CFG.get("show_debug", False))        # true=弹窗显示处理过程
+
+# 圆环数字被上一轮物块遮挡时，按物块颜色反推数字（config.yaml → placement 段）
+OCCLUDED_DIGIT_BY_COLOR = bool(_PLACE_CFG.get("occluded_digit_by_color", True))
+OCCLUDED_COLOR_CROP_RATIO = _place_float("occluded_color_crop_ratio", 0.6)
+OCCLUDED_COLOR_MIN_AREA = _place_float("occluded_color_min_area", 150)
+OCCLUDED_COLOR_AREA_MARGIN = _place_float("occluded_color_area_margin", 1.4)
+OCCLUDED_COLOR_OVERRIDE_DIGIT = bool(_PLACE_CFG.get("occluded_color_override_digit", True))
 
 _last_debug_print_t = 0.0
 
@@ -201,11 +209,75 @@ class PlacementRecognizer:
             self.last_digit_canvas = debug_canvas
         return digit, float(confidence), debug_canvas
 
-    def recognize_all(self, frame, roi=None):
+    def detect_ring_block_color(self, frame, ring, candidate_codes):
+        """
+        在圆环中心裁剪彩色 ROI，用 HSV 阈值识别圆环上物块颜色。
+
+        candidate_codes: 待识别颜色代码列表（如 ["1","5","6"]）。
+
+        返回 (color_code, area, confidence)：
+          - color_code: 识别出的颜色代码；未识别到或区分度不足时为 None
+          - area: 最佳颜色掩膜面积（px²）
+          - confidence: 0~1，最佳面积相对次佳面积的领先度
+        """
+        if not candidate_codes or frame is None or len(frame.shape) != 3:
+            return None, 0, 0.0
+        cx, cy = ring["center"]
+        radius = ring["radius"]
+        crop_r = max(int(MIN_CROP_PX), int(radius * OCCLUDED_COLOR_CROP_RATIO))
+        x0 = max(0, int(cx - crop_r))
+        y0 = max(0, int(cy - crop_r))
+        x1 = min(frame.shape[1], int(cx + crop_r))
+        y1 = min(frame.shape[0], int(cy + crop_r))
+        if x1 <= x0 or y1 <= y0:
+            return None, 0, 0.0
+
+        crop = frame[y0:y1, x0:x1]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        keys = [CODE_TO_KEY[c] for c in candidate_codes if c in CODE_TO_KEY]
+        if not keys:
+            return None, 0, 0.0
+        masks = build_color_masks(hsv, color_keys=keys)
+
+        # 只统计圆环中心圆形区域内的颜色，排除圆环本身黑色边框的干扰
+        circle_mask = np.zeros(crop.shape[:2], np.uint8)
+        cv2.circle(
+            circle_mask,
+            (int(cx - x0), int(cy - y0)),
+            crop_r,
+            255,
+            -1,
+        )
+        areas = {}
+        for code in candidate_codes:
+            key = CODE_TO_KEY.get(code)
+            if key is not None:
+                masked = cv2.bitwise_and(
+                    masks[key], masks[key], mask=circle_mask
+                )
+                areas[code] = int(cv2.countNonZero(masked))
+        if not areas:
+            return None, 0, 0.0
+
+        best_code = max(areas, key=areas.get)
+        best_area = areas[best_code]
+        if best_area < OCCLUDED_COLOR_MIN_AREA:
+            return None, 0, 0.0
+        second_area = sorted(areas.values())[-2] if len(areas) > 1 else 0
+        if best_area < second_area * OCCLUDED_COLOR_AREA_MARGIN:
+            return None, 0, 0.0
+        confidence = float(
+            np.clip((best_area - second_area) / best_area, 0.0, 1.0)
+        )
+        return best_code, best_area, confidence
+
+    def recognize_all(self, frame, roi=None, digit_of_color=None):
         """
         识别一帧放置区画面的所有圆环（含数字识别结果）。
 
         roi: [x, y, w, h]，非 None 时只识别圆心在该区域内的圆环。
+        digit_of_color: 上一轮“物块颜色代码 → 圆环数字”映射；
+            圆环数字被上一轮物块遮挡时，按圆环上物块颜色反推数字。
 
         返回:
             [{"center", "radius", "contour", "digit", "confidence"}, ...]
@@ -235,6 +307,21 @@ class PlacementRecognizer:
                 if digit in (1, 2, 3) and confidence >= MIN_DIGIT_CONFIDENCE:
                     item["digit"] = digit
                     item["confidence"] = float(confidence)
+
+            # 数字被上一轮物块遮挡时，用圆环上物块颜色反推数字
+            if digit_of_color and OCCLUDED_DIGIT_BY_COLOR:
+                color_code, color_area, color_conf = self.detect_ring_block_color(
+                    frame, ring, list(digit_of_color.keys())
+                )
+                if color_code is not None and color_code in digit_of_color:
+                    item["color_code"] = color_code
+                    item["color_area"] = color_area
+                    item["color_conf"] = color_conf
+                    item["inferred_by_color"] = True
+                    inferred_digit = digit_of_color[color_code]
+                    if OCCLUDED_COLOR_OVERRIDE_DIGIT or item["digit"] is None:
+                        item["digit"] = inferred_digit
+                        item["confidence"] = color_conf
             all_rings.append(item)
 
         if SHOW_DEBUG:
@@ -277,6 +364,11 @@ class PlacementRecognizer:
                             if perimeter > 0 else 0.0)
                     if ring["raw_digit"] is None:
                         digit_txt = "无数字轮廓"
+                    elif ring.get("inferred_by_color"):
+                        digit_txt = (f"颜色推断 {ring.get('color_code')}→"
+                                     f"数字{ring['digit']} "
+                                     f"面积{ring.get('color_area')} "
+                                     f"置信度{ring['confidence']:.2f}")
                     elif ring["digit"] is not None:
                         digit_txt = (f"数字{ring['digit']} 通过 "
                                      f"置信度{ring['confidence']:.2f}")

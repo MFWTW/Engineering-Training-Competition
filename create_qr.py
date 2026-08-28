@@ -1,7 +1,7 @@
 import qrcode
 
 # 生成二维码
-data = "216+132+612+231"
+data = "246+132+642+231"
 img = qrcode.make(data)
 
 # 保存图片

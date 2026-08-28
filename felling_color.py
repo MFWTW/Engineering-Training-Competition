@@ -52,6 +52,35 @@ CODE_TO_KEY = {code: name for name, code in COLOR_CODE_MAP.items()}
 _DET_CFG = CONFIG["detection"]
 
 
+def build_color_masks(hsv_img, color_keys=None):
+    """按颜色名列表构建 HSV 掩膜（复用阈值 + 形态学参数）。
+
+    color_keys 为 None 时构建全部 6 色掩膜；否则只构建指定颜色。
+    """
+    if color_keys is None:
+        color_keys = COLOR_KEYS
+    k = int(_DET_CFG.get("kernel_size", 3))
+    kernel = np.ones((k, k), np.uint8)
+    masks = {}
+    for color_key in color_keys:
+        cfg = color_thresholds[color_key]
+        if 'lower1' in cfg:  # 双阈值（红色）
+            m1 = cv2.inRange(hsv_img,
+                             np.array(cfg['lower1']), np.array(cfg['upper1']))
+            m2 = cv2.inRange(hsv_img,
+                             np.array(cfg['lower2']), np.array(cfg['upper2']))
+            mask = cv2.bitwise_or(m1, m2)
+        else:
+            mask = cv2.inRange(hsv_img,
+                               np.array(cfg['lower']), np.array(cfg['upper']))
+        # 形态学
+        e_iter, d_iter = MORPH_PARAMS[color_key]
+        mask = cv2.erode(mask, kernel, iterations=e_iter)
+        mask = cv2.dilate(mask, kernel, iterations=d_iter)
+        masks[color_key] = mask
+    return masks
+
+
 class BlockDetector:
     """物块颜色检测器 —— 封装所有检测状态，支持 reset 重置"""
 

@@ -1,3 +1,24 @@
+# ==================== 物块识别追踪系统 统一配置 ====================
+# 所有可调参数集中在这里，修改后重启 src.py 生效。
+# 各段对应的读取模块：
+#   colors      → felling_color.py        （HSV 颜色阈值，hsv_tuner.py 可在线调参并写回）
+#   detection   → felling_color.py        （物块颜色检测器 BlockDetector）
+#   placement   → placement.py            （圆环/数字识别、遮挡反推、托盘阶段）
+#   transformer → transformer.py          （相机坐标 → 世界坐标换算）
+#   filter / one_euro / kalman / kalman_world → src.py 位置滤波
+#   chassis / control / tracking / safety / logging / planner → src.py 主控制
+#   display     → src.py + qr_display.py  （画面显示与外接屏）
+#   protocol    → gimbal.py               （串口动作码约定）
+#
+# 单位约定：图像坐标 = px，底盘/夹爪 = mm，transformer 段 = cm。
+
+# ==================== 颜色 HSV 阈值 ====================
+# H 范围 0~180（OpenCV），S/V 范围 0~255。
+# lower/upper = [H_min, S_min, V_min] / [H_max, S_max, V_max]。
+# 红色色相跨 0 度，用两段区间（lower1/upper1 + lower2/upper2）。
+# morph.erode / morph.dilate：腐蚀/膨胀次数，用于去噪；
+#   越大越抗噪，但小目标/远处目标越容易被过滤掉。
+# order：6 种颜色统一检测时的顺序（QR 里的颜色代号另有 code 字段）。
 colors:
   order:
   - red
@@ -6,6 +27,7 @@ colors:
   - light_blue
   - black
   - yellow
+  # 红色（QR 代号 1）
   red:
     code: '1'
     label: 红色
@@ -28,6 +50,7 @@ colors:
     morph:
       erode: 1
       dilate: 2
+  # 绿色（QR 代号 4）
   green:
     code: '4'
     label: 绿色
@@ -42,6 +65,7 @@ colors:
     morph:
       erode: 2
       dilate: 6
+  # 蓝色（QR 代号 3）
   blue:
     code: '3'
     label: 蓝色
@@ -56,6 +80,7 @@ colors:
     morph:
       erode: 1
       dilate: 3
+  # 浅蓝（QR 代号 6）
   light_blue:
     code: '6'
     label: 浅蓝
@@ -70,6 +95,7 @@ colors:
     morph:
       erode: 1
       dilate: 3
+  # 黑色（QR 代号 5）
   black:
     code: '5'
     label: 黑色
@@ -79,11 +105,12 @@ colors:
     - 0
     upper:
     - 180
-    - 162
-    - 105
+    - 255
+    - 43
     morph:
       erode: 1
       dilate: 3
+  # 黄色（QR 代号 2）
   yellow:
     code: '2'
     label: 黄色
@@ -98,59 +125,108 @@ colors:
     morph:
       erode: 1
       dilate: 3
+# ==================== 物块检测（felling_color.py） ====================
+# detection_area: 检测 ROI [x, y, w, h]（图像左上角为原点，640x480 画面）。
+#   只在该区域内找物块，可排除场地边缘/自身部件误检；null = 全图。
 detection:
   detection_area:
-  - 140
+  - 160
   - 190
-  - 360
-  - 220
+  - 340
+  - 190
+  # 颜色掩膜形态学核大小（px）
   kernel_size: 3
   blur:
+    # 灰度高斯模糊核与标准差，用于抑制噪声
     kernel: 5
     sigma_x: 2
     sigma_y: 2
   circle:
+    # 物块最小外接圆半径范围（px）
     min_radius: 35
     max_radius: 75
+    # 面积门限系数：候选面积需 ≥ π * min_radius² * min_area_factor
     min_area_factor: 0.2
   stability:
+    # 抓取前的稳定条件（两条件独立计数、都满足才算稳定）：
     threshold: 15
+    #   位置：连续 threshold 帧，且相邻帧圆心位移 < max_pixel_move(px)
     max_pixel_move: 10
+    #   颜色：连续 color_stable_threshold 帧识别为同一颜色
     color_stable_threshold: 5
+  # 物块消失超过该毫秒数后丢弃上一帧结果
   timeout_ms: 100
+
+# ==================== 放置阶段（placement.py） ====================
 placement:
+  # 圆环数字识别模型路径（3 分类权重）
   model_path: /home/xu/Engineer/tiny_digit_cnn_3class.pth
+  # 放置时夹爪策略：min=固定最短、max=固定最长、dynamic=跟随视觉动态调节；
+  # gripper_fixed_mm 非空时优先生效（自定义固定伸长量 mm）
   gripper_fixed: min
   gripper_fixed_mm: 40
+  # true=打印圆环/数字识别调试日志（约 1 秒 1 条）
   debug: true
+  # true=弹窗显示二值化/圆环/数字裁剪等处理过程
   show_debug: true
+  # 数字裁剪半径 = 圆环半径 × 该值
   digit_crop_ratio: 0.7
-  min_ring_radius: 20
+  # 圆环过滤：最小半径（px）
+  min_ring_radius: 30
+  # 圆环过滤：最小面积（px²）
   min_ring_area: 350
+  # 圆环过滤：圆度下限 4πA/P²（0~1，越接近 1 越圆）
   ring_circularity: 0.6
-  min_digit_confidence: 0.6
+  # MNIST 数字识别最低置信度（0~1）
+  min_digit_confidence: 0.7
+  # 同心圆分组判定系数：两圆心距离 < 较大半径 × 该值则视为同一组
   ring_group_overlap: 0.8
+  # 二值化后形态学闭运算核大小
   morph_kernel_size: 5
+  # 数字/颜色裁剪最小半径（px），防止圆环过小时裁剪为 0
   min_crop_px: 12
+  # 圆环数字被上一轮留在放置区的物块遮挡时，
+  # 用圆环上物块颜色反推圆环数字（如第 2 轮放置区 B）
+  occluded_digit_by_color: true
+  # 颜色检测只统计圆环中心半径 = 圆环半径 × 该值的圆形区域（避开圆环黑边）
+  occluded_color_crop_ratio: 0.6
+  # 颜色掩膜面积下限（px²），低于该值视为没检测到物块
+  occluded_color_min_area: 150
+  # 最佳颜色面积需 ≥ 次佳面积 × 该值，否则视为颜色区分度不足
+  occluded_color_area_margin: 1.4
+  # true=颜色推断到数字时覆盖 MNIST 结果；false=仅在 MNIST 失败时用颜色推断
+  occluded_color_override_digit: true
+  # true=把每次实际放置顺序追加写入 placement_order_log
   record_placement_order: true
   placement_order_log: /home/xu/Engineer/placement_order.log
+  # 放置阶段位置稳定条件：连续稳定帧数
   place_stable_threshold: 30
+  # 放置阶段相邻帧圆心最大位移（px），超过则稳定计数清零
   place_stable_max_pixel_move: 6
+  # true=放置完成后进入托盘阶段（把物块夹回后部槽位）
   tray_phase_enabled: true
+  # 托盘抓取顺序：reverse=按实际放置顺序倒序；actual=按实际放置顺序
   tray_phase_order: reverse
+  # 托盘阶段动作码（保留兼容，默认 1=抓取）
   tray_phase_action: 1
+  # true=每轮最后一次放置（放置区 B）不夹起，直接进下一轮
   tray_phase_skip_last_of_round: true
-  # 托盘阶段 arrived 处理：edge=逐托盘等 0→1 上升沿（代码默认）；
-  # 下位机在 capture=1 时把 arrived 置 0、动作结束（capture=0）后置 1，
-  # 因此每个托盘/动作结束都会产生 0→1 上升沿，用 edge 即可。
-  # none=不等待 arrived，进入即抓、抓完立即下一个（仅在无上升沿时用）
+  # 托盘阶段 arrived 处理：edge=逐托盘等 0→1 上升沿；
+  # none=不等待 arrived，进入即抓、抓完立即下一个（无上升沿时用）
   tray_phase_arrived_mode: edge
-  tray_gripper_fixed: 30
+  # 倒序托盘阶段夹爪策略：dynamic=动态、min/max=固定最短/最长、
+  # 数字=固定伸长 mm；actual 顺序时复用 tracking.grab_gripper_fixed
+  tray_gripper_fixed: 40
+
+# ==================== 坐标换算（transformer.py） ====================
+# 长度单位均为 cm。所有"相机坐标"均以相机光心为原点。
 transformer:
+  # 相机在车中心坐标系中的安装位置 [x, y, z] cm
   camera1world_coordinate:
   - 0
   - 21.595
   - 20
+  # 夹爪最长/最短时相机到车中心的距离 [x, y, z] cm（用于夹爪/底盘决策上下限）
   max_jar_dis:
   - 0
   - 37.6
@@ -159,43 +235,71 @@ transformer:
   - 0
   - 21.595
   - 0
+  # 底盘/夹爪协同决策的左右/前后容差（cm）
   lateral_tolerance_cm: 0.3
   longitudinal_tolerance_cm: 0.4
+  # 内参标定的基准分辨率（与实际画面不一致时按比例缩放内参）
   calib_image_width: 640
   calib_image_height: 480
+  # 相机内参（由 calibrate_camera.py 标定，一般不用手改）
   focal_px_x: 366.99093917961704
   focal_px_y: 364.25895585724794
   principal_px_x: 314.8605084989312
   principal_px_y: 247.66418301001914
+  # 径向/切向畸变系数 [k1, k2, p1, p2, k3]
   dist_coeffs:
   - -0.012076444385052124
   - 0.0016723981571138394
   - 0.0018108447968222718
   - -0.002827491845898441
   - -0.024264465499757897
+  # 相机光心离地高度（cm）
   camera_height_cm: 29
+  # 物块立放/平放时顶面高度（cm），用于像素→世界换算的物块高度补偿
   block_height_cm: 14.3
   block_height_placed_cm: 6.0
+  # 相机俯仰角（度）：正=向下，90=垂直向下（当前相机为垂直向下安装）
   camera_pitch_deg: 91
+
+# ==================== 位置滤波（src.py） ====================
+# type：none=不滤波；kalman=像素系卡尔曼；kalman_world=世界系卡尔曼；
+#       one_euro=一欧元低通
 filter:
   type: none
+
+# ==================== 一欧元低通滤波（one_euro_filter.py） ====================
 one_euro:
+  # 最小截止频率：越小越平滑（慢速目标）
   min_cutoff: 0.8
+  # 速度响应系数：越大越快跟手（快速目标）
   beta: 0.05
+  # 速度估计截止频率
   d_cutoff: 0.4
+  # 速度估计用滑动窗口长度
   velocity_window: 12
+  # 帧间隔下限/上限（秒），防断帧导致 dt 异常
   dt_min_s: 0.005
   dt_max_s: 0.2
+
+# ==================== 像素系卡尔曼（kalman_tracker.py） ====================
+# 状态 = [x, y, vx, vy, ax, ay]，单位 px / px/s / px/s²
 kalman:
+  # 固定帧间隔（秒）
   dt: 0.03333333333333333
+  # 初始协方差
   initial_p: 80.0
+  # 加速度过程噪声（越大越信任测量）
   q_acc: 17.0
+  # 测量噪声（px）
   meas_std: 2.0
+  # 轨迹历史长度（画线用）
   history_len: 100
   predict:
+    # 未来轨迹预测时长（秒）与步数
     horizon_s: 2.0
     steps: 6
   visualize:
+    # 画面叠加：原始圈/滤波圈/预测轨迹/拦截点/速度箭头/历史轨迹
     enabled: true
     draw_raw: true
     draw_filtered: true
@@ -204,59 +308,123 @@ kalman:
     draw_speed: true
     draw_history: true
     history_trail_len: 30
+
+# ==================== 世界系卡尔曼（kalman_tracker.py） ====================
+# 状态 = 车中心系坐标 [x, y, vx, vy, ax, ay]，单位 mm / mm/s / mm/s²
 kalman_world:
   dt: 0.03333333333333333
   initial_p: 80.0
+  # 加速度过程噪声（mm/s² 尺度）
   q_acc: 150.0
+  # 测量噪声（mm）
   meas_std: 3
   history_len: 100
+  # true=把下位机回传的底盘速度作为卡尔曼控制输入
   use_chassis_velocity: false
+  # 夹爪反馈低通系数（0~1）：越大越跟手、越小越平滑
   gripper_meas_filter: 0.1
   predict:
     horizon_s: 2.0
     steps: 3
+
+# ==================== 底盘换算（src.py 拦截规划用） ====================
 chassis:
-  px_per_mm: 0.15
+  # 下位机 mm / mm/s → 图像 px / px/s 的倍率（calibrate_px_per_mm.py 标定）
+  px_per_mm: 0.165
+
+# ==================== 主控制开关（src.py → control） ====================
 control:
+  # true=扫码后跳过第 1 轮抓取，直接去放置区（物块已就位时单独调放置）
   skip_grab: false
+  # true=只调抓取：抓完当前轮即退出，不进放置阶段
   grab_only: false
+  # 抓取阶段 x/y 对准容差（px）：|目标-图像中心| ≤ 容差才发 capture=1
   grab_center_tolerance_px: 20
   grab_center_tolerance_y_px: 20
+  # 放置阶段 x/y 对准容差（px）
   place_center_tolerance_px: 8
   place_center_tolerance_y_px: 8
+
+# ==================== 串口发送/跟踪（src.py → tracking） ====================
 tracking:
+  # 发 capture=1 后未收到 capture_ack，每隔该秒数重发一次
   capture_resend_interval: 1.0
+  # 普通跟踪包（capture=0）最小发送间隔（秒）
   send_interval: 0.02
+  # 底盘/夹爪指令相对上次发送变化小于该值（mm）则不重发（死区）
   chassis_send_deadband_mm: 2
   gripper_deadband_mm: 2
+  # 抓取阶段固定夹爪伸长量（mm），None/0=动态调节
   grab_gripper_fixed: 40
+  # 固定夹爪模式：等待夹爪反馈到位（误差 ≤ 该值 mm）才允许底盘跟踪
   grab_gripper_settle_tolerance_mm: 3
+  # 夹爪到位等待超时（秒），超时不再等
   grab_gripper_settle_timeout_s: 5.0
+  # 底盘指令斜率限幅：每个发送周期目标最多变化该值（mm），防起步/减速猛冲
   chassis_ramp_step_mm: 20
+  # 心跳：跟踪指令变化很小时也每隔该秒数重发一次
   send_heartbeat: 2
+  # 底盘前瞻时间（毫秒）：0=关闭；>0 时把物块速度外推该时长再计算目标
   chassis_lookahead_ms: 0
+  # 前瞻速度上限（mm/s），防止物块速度异常时目标飞太远
   chassis_lookahead_max_speed_mm_s: 50
+
+# ==================== 画面显示（src.py + qr_display.py） ====================
 display:
+  # 主画面最大显示尺寸（OpenCV 窗口缩放上限）
   max_width: 800
   max_height: 540
   serial_overlay:
+    # 画面左上角叠加串口收发信息
     enabled: true
     max_lines: 4
+  qr_display:
+    # true=src.py 启动时自动拉起外接屏显示进程
+    enabled: true
+    # 显示进程的 DISPLAY（本机物理外接屏为 :0；留空=继承当前会话）
+    display: :0
+    # 对应 X 会话的授权文件
+    xauthority: /run/user/1000/gdm/Xauthority
+    # 外接屏显示器编号（null=自动选择）
+    monitor: 0
+    # 扫码结果状态文件（qr_display.py 监视该文件更新显示）
+    state_file: /tmp/qr_display_result.txt
+    log_file: /tmp/qr_display.log
+    # true=启动时若已有旧显示进程，先请它退出再接管
+    replace: true
+
+# ==================== 串口协议动作码（gimbal.py） ====================
 protocol:
+  # 上位机 → 下位机 action 字段：0=启动/空闲，1=抓取，2=放置
   idle_action: 0
   grab_action: 1
   place_action: 2
+
+# ==================== 指令安全限幅（src.py） ====================
 safety:
+  # 底盘单轴指令绝对值上限（mm），超限时按上一帧有效值沿用/截断
   max_chassis_cmd_mm: 100000
+  # 夹爪伸长量上限（mm）
   max_gripper_mm: 180
+
+# ==================== 日志（src.py） ====================
 logging:
+  # 抓取/放置指令日志最短打印间隔（秒）
   command_print_interval: 0.5
+  # 坐标无效等告警的最短打印间隔（秒）
   warn_interval_s: 1.0
+  # 控制台输出同时追加写入的日志文件
   log_file: ./log.txt
+
+# ==================== 拦截规划器（intercept_planner.py） ====================
 planner:
+  # 小车动力学（px 单位）：最大速度、加速度、减速度
   car_max_speed_px_per_s: 400.0
   car_accel_px_per_s2: 200.0
   car_decel_px_per_s2: 200.0
+  # 博弈求解时间步长（秒）
   time_resolution_s: 0.02
+  # 最大预测时长（秒）
   max_predict_time_s: 1
+  # 到达时间允许误差（秒）
   tolerance_s: 0.1

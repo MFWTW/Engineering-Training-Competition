@@ -17,6 +17,7 @@
 | 手写数字识别 | `felling_number.py` | USB 实时取流 + 轻量 CNN（MNIST）识别数字 |
 | HSV 调参工具 | `hsv_tuner.py` | Trackbar 实时调节 6 色 HSV 阈值 |
 | QR 工具 | `create_qr.py` | 生成测试二维码（如 `156+123+516+231`） |
+| 外接屏显示 | `qr_display.py` | 把扫码结果大字显示在外接显示器上（监视状态文件） |
 | 旧版整机程序 | `example_code.py` | 旧架构整机代码（含多种定标流程），仅作参考 |
 
 ---
@@ -34,6 +35,7 @@
 ├── camera_setup.py           # 摄像头角色配置工具（一次指定扫码/物块检测相机）
 ├── preprocessing.py          # 图像预处理（Otsu 二值化）
 ├── scan_QRcode_andlist.py    # QR 码扫描与目标序列解析
+├── qr_display.py             # 外接屏幕大字显示扫码结果（独立运行）
 ├── felling_color.py          # 物块颜色检测器（HSV 阈值 + 轮廓 + 稳定性判定）
 ├── config.yaml               # 颜色阈值 / 形态学 / 稳定性 / 单位换算等统一参数（YAML）
 ├── kalman_tracker.py         # 6 维卡尔曼滤波（状态估计）
@@ -75,6 +77,9 @@
 `repeat=2` 表示每轮有 2 个放置区（A、B）；只有第 1 个放置区放完后执行托盘阶段。
 
 屏幕叠加显示仍保持二维码扫到的 4 组原始数字。
+`scan_QRcode_andlist.py` 每次扫到二维码还会把原始内容写入
+`/tmp/qr_display_result.txt`（可用环境变量 `QR_DISPLAY_FILE` 改路径），
+由 `qr_display.py` 在外接屏幕上大字显示。
 
 #### ① QR 扫描阶段
 
@@ -114,6 +119,11 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
 3. 圆环识别：同心圆轮廓分组取最内层，中心裁剪 ROI 后用 MNIST 识别数字；
    数字必须是 1~3 且置信度 ≥ `min_digit_confidence`（0.8），
    且不在 `placed_digits` 中、必须在本轮 `slot_of_place_digit` 映射内；
+   - **遮挡反推**（`placement.occluded_digit_by_color=true` 时）：当圆环数字
+     被上一轮留在放置区的物块挡住（如第 2 轮放置区 B），MNIST 识别不可靠时，
+     改为识别圆环中心物块颜色，再按上一轮“槽位一致”关系反推出圆环数字
+     （颜色 → 上一轮槽位 → 上一轮圆环数字），之后仍按该数字对应的槽位
+     取本轮物块放置；
 4. 多个候选取离图像中心最近的一个；**位置连续稳定 N 帧**
    （`placement.place_stable_threshold`，默认 30 帧，相邻帧圆心位移
    `< placement.place_stable_max_pixel_move`，默认 20px）
@@ -145,6 +155,10 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
    再开始下一个托盘；
 4. 最后一个托盘抓完后，下位机再发 `arrived` 时不再夹起，
    直接前往下一个放置区/下一轮（`advance_after_placement_cycle`）。
+   - 当前临时实现：这个 `arrived=1` 直接当作“已到达下一个放置区”，
+     不再重发 `action=2`、不再等新的 0→1 上升沿。
+     原因：下位机在收到 `action=2` 后若没有先把 `arrived` 拉回 0，
+     旧流程会永远卡在“等待新的 arrived=1”。
 
 #### ⑥ 轮次重复与收尾
 
@@ -350,6 +364,11 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `placement.ring_group_overlap` | `0.8` | 同心圆分组判定系数 |
 | `placement.morph_kernel_size` | `5` | 二值化后闭运算核大小 |
 | `placement.min_crop_px` | `12` | 数字裁剪最小半径（px） |
+| `placement.occluded_digit_by_color` | `true` | 圆环数字被上一轮物块遮挡时，按圆环上物块颜色反推数字（第 2 轮放置区 B 场景） |
+| `placement.occluded_color_crop_ratio` | `0.6` | 颜色检测只统计圆环中心半径 = 圆环半径 × 该值的圆形区域（避开圆环黑色边框干扰） |
+| `placement.occluded_color_min_area` | `150` | 颜色掩膜面积下限（px²），低于该值视为没检测到物块 |
+| `placement.occluded_color_area_margin` | `1.4` | 最佳颜色面积需 ≥ 次佳面积 × 该值，否则视为颜色区分度不足 |
+| `placement.occluded_color_override_digit` | `true` | `true`=颜色推断到数字时覆盖 MNIST 结果；`false`=仅在 MNIST 识别失败时用颜色推断 |
 | `placement.place_stable_threshold` | `30` | 放置阶段位置连续稳定帧数 |
 | `placement.place_stable_max_pixel_move` | `20` | 放置阶段相邻帧圆心最大位移（px） |
 | `placement.record_placement_order` | `true` | `true` 时把每次实际放置的圆环数字按先后顺序追加写入 `placement_order.log`，并在每轮完成后追加“托盘阶段抓取顺序”（数字即托盘号） |
@@ -647,6 +666,63 @@ python3 validate_transform.py --pitch-deg 40
 ```bash
 python3 create_qr.py
 ```
+
+### qr_display.py —— 外接屏幕显示扫码结果
+
+外接屏幕大字显示扫码结果的程序。`src.py` 启动时会自动拉起它，
+扫码后外接屏幕会自动切换为超大字体显示识别到的数字
+（如 `156+123+516+231`）；也可以手动独立运行。
+
+```bash
+# 自动选择外接屏（HDMI/DP/VGA 优先，多屏时其次选第 2 个屏）
+python3 qr_display.py
+
+# 指定第 2 个显示器 / 指定状态文件 / 直接显示固定内容（调试）
+python3 qr_display.py --monitor 1
+python3 qr_display.py --file /tmp/qr_result.txt
+python3 qr_display.py --text 156+123
+
+# 已有旧显示实例占着单实例锁时，用 --replace 请它退出并接管
+python3 qr_display.py --replace
+```
+
+如果窗口没有出现在外接屏上，说明当前 `DISPLAY` 不是接外接屏的那个桌面，
+先切换显示，例如：
+
+```bash
+# 本机：物理外接屏在 :0，远程桌面（XRDP）在 :10
+DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority python3 qr_display.py --monitor 0
+```
+
+`src.py` 自动拉起时的行为由 `config.yaml` 的 `display.qr_display` 控制：
+
+```yaml
+display:
+  qr_display:
+    enabled: true      # 是否由 src.py 自动启动显示端
+    display: ":0"      # 固定到物理外接屏所在会话（本机为 :0）
+    xauthority: "/run/user/1000/gdm/Xauthority"  # 物理会话的 X 授权文件
+    monitor: 0         # 0 = 物理会话中的第一个显示器；null=自动选外接屏
+    state_file: /tmp/qr_display_result.txt
+    log_file: /tmp/qr_display.log
+    replace: true      # 启动时若有旧显示进程，先请其退出再接管
+```
+
+每次运行 `src.py` 会先清空状态文件，外接屏显示“等待扫码...”，
+扫到二维码后自动更新为识别结果。
+显示进程以独立会话启动并忽略 SIGHUP，输出写入 `log_file`；
+即使 `src.py` 被 Ctrl+C 停止、或运行它的终端被关闭，外接屏仍保留最后结果。
+显示进程启动即退出时（如 DISPLAY 连不上），`src.py` 会把日志最后几行打印出来，
+方便定位。可在显示窗口按 `Esc` / `Q` 关闭显示，或：
+
+```bash
+kill $(cat /tmp/qr_display.lock)
+```
+
+注意：`display` 留空（推荐）时窗口显示在运行 `src.py` 的那个会话里；
+本机已填 `:0` + 对应 `xauthority`，所以无论 `src.py` 在 XRDP 远程桌面（`:10`）
+还是物理桌面（`:0`）里启动，二维码窗口都固定显示在物理外接屏上；
+若 X 授权文件不对，显示进程会因无授权而启动即退出。
 
 ---
 

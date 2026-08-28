@@ -1,8 +1,20 @@
+import os
+
 import cv2
 from pyzbar.pyzbar import decode
 
 session = []
 groups = []
+
+
+def save_qr_result(data):
+    """把扫码结果写入状态文件，供 qr_display.py 在外接屏幕上显示。"""
+    path = os.environ.get("QR_DISPLAY_FILE", "/tmp/qr_display_result.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+    except OSError as exc:
+        print(f"[QR] 写入屏幕显示文件失败 {path}: {exc}")
 
 
 def scan_qrcode(thre_image, RAM_image):
@@ -37,6 +49,7 @@ def decode_data(data):
         groups.append(num_group)
         for digit in num_group:
             session.append(digit)
+    save_qr_result(data)
 
 if __name__ == "__main__":
     scan_qrcode()

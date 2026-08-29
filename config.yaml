@@ -131,7 +131,7 @@ colors:
 detection:
   detection_area:
   - 160
-  - 190
+  - 170
   - 340
   - 190
   # 颜色掩膜形态学核大小（px）
@@ -181,6 +181,21 @@ placement:
   min_digit_confidence: 0.7
   # 同心圆分组判定系数：两圆心距离 < 较大半径 × 该值则视为同一组
   ring_group_overlap: 0.8
+  # 圆心距 ROI 边界的最小距离（相对圆环半径的比例）：
+  # 太靠近边界时圆环会被裁剪，minEnclosingCircle 圆心会向边缘漂移，视为残缺圆环丢弃
+  ring_roi_margin_ratio: 0.3
+  # 圆心改用最小二乘圆拟合：轮廓残缺/噪声时圆心比 minEnclosingCircle 稳定。
+  # 平均径向残差超过该值(px)时回退到 minEnclosingCircle
+  ring_fit_max_residual_px: 4.0
+  # HoughCircles 修正圆心（可选）：true 时用 Hough 投票圆心替换匹配到的轮廓圆心，
+  # 圆被部分遮挡时圆心更稳；找不到圆时自动回退轮廓法
+  ring_hough_enabled: false
+  hough_min_radius: 25
+  hough_max_radius: 60
+  hough_min_dist: 90
+  hough_param1: 100
+  hough_param2: 30
+  hough_match_px: 15
   # 二值化后形态学闭运算核大小
   morph_kernel_size: 5
   # 数字/颜色裁剪最小半径（px），防止圆环过小时裁剪为 0
@@ -189,7 +204,7 @@ placement:
   # 用圆环上物块颜色反推圆环数字（如第 2 轮放置区 B）
   occluded_digit_by_color: true
   # 颜色检测只统计圆环中心半径 = 圆环半径 × 该值的圆形区域（避开圆环黑边）
-  occluded_color_crop_ratio: 0.6
+  occluded_color_crop_ratio: 0.3
   # 颜色掩膜面积下限（px²），低于该值视为没检测到物块
   occluded_color_min_area: 150
   # 最佳颜色面积需 ≥ 次佳面积 × 该值，否则视为颜色区分度不足
@@ -203,6 +218,15 @@ placement:
   place_stable_threshold: 30
   # 放置阶段相邻帧圆心最大位移（px），超过则稳定计数清零
   place_stable_max_pixel_move: 6
+  # 圆心 EMA 平滑系数（0~1）：越大越跟手，越小越抗识别抖动。
+  # 识别偶发跳边时只被衰减，不会像“丢弃帧”那样把车辆完全卡住
+  place_center_smooth_alpha: 0.3
+  # 视觉误差增益（0~1）：目标位置 = 回传位置 + 视觉误差 × 增益。
+  # 降增益让底盘只响应持续存在的偏差，避免单帧识别噪声被全量放大
+  place_visual_gain: 0.5
+  # 放置阶段底盘指令变化死区（mm）：比 tracking.chassis_send_deadband_mm 大，
+  # 过滤小幅识别抖动，只有偏差累积到超过该值才重新发指令
+  place_chassis_deadband_mm: 5
   # true=放置完成后进入托盘阶段（把物块夹回后部槽位）
   tray_phase_enabled: true
   # 托盘抓取顺序：reverse=按实际放置顺序倒序；actual=按实际放置顺序
@@ -341,6 +365,12 @@ control:
   # 抓取阶段 x/y 对准容差（px）：|目标-图像中心| ≤ 容差才发 capture=1
   grab_center_tolerance_px: 20
   grab_center_tolerance_y_px: 20
+  # 抓取区“开始识别时第一目标已在场”跳过逻辑（仅本轮第一个目标，托盘阶段不适用）：
+  # 到达抓取区开始识别时，若判定窗口内就检测到第一目标颜色，说明复位期间
+  # 它已经/正在转走，本圈不跟踪不抓取，等它转一圈重新出现后再按正常流程抓取。
+  grab_skip_first_enabled: true
+  # 判定窗口（帧）：开始识别后的前 N 帧内检测到第一目标颜色即判定“已在场”
+  grab_skip_first_eval_frames: 5
   # 放置阶段 x/y 对准容差（px）
   place_center_tolerance_px: 8
   place_center_tolerance_y_px: 8

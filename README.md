@@ -100,6 +100,10 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
 
 1. 到达抓取区（`arrived` 0→1）后，打印“第 X 轮第 Y 次抓取顺序: [...]”，重建 `slot_of_color`；
 2. 每帧只检测当前目标颜色（按序列顺序），颜色稳定后发送跟踪指令 `capture=0`；
+   - 到达抓取区开始识别时，若判定窗口（`control.grab_skip_first_eval_frames`，
+     默认 5 帧）内就检测到第一目标颜色（`control.grab_skip_first_enabled`，默认开），
+     说明复位期间它已经/正在转走，本圈不跟踪不抓取，
+     等它转一圈重新出现后再按正常流程抓取；窗口内没看到第一目标则按正常顺序抓。
 3. 配置了 `grab_gripper_fixed` 时先等夹爪反馈到位（`grab_gripper_settle_*`），
    之后才允许底盘跟踪；位置稳定且 x 偏移 ≤ `grab_center_tolerance_px`（20px）
    → 发送 `capture=1`，记录 `last_grabbed_slot`，进入等待；
@@ -247,6 +251,8 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `control.skip_grab` | `false` | `true` 时扫描二维码后跳过抓取，直接前往放置区（物块已就位、单独调放置） |
 | `control.grab_only` | `false` | `true` 时扫描二维码后只调试抓取：抓完当前轮即退出，跳过放置阶段 |
 | `control.grab_center_tolerance_px` | `20` | 抓取阶段 x 轴（左右）对准容差（px）：\|目标x - 图像中心x\| ≤ 该值即请求抓取 |
+| `control.grab_skip_first_enabled` | `true` | 抓取区“开始识别时第一目标已在场”跳过：到达抓取区开始识别时，判定窗口内已检测到第一目标颜色则本圈不抓，等下一圈 |
+| `control.grab_skip_first_eval_frames` | `5` | 开始识别后的判定窗口（帧）：前 N 帧内检测到第一目标颜色即判定“已在场” |
 | `control.place_center_tolerance_px` | `5` | 放置阶段 x 轴（左右）对准容差（px）：\|目标x - 图像中心x\| ≤ 该值即请求放置 |
 | `tracking.capture_resend_interval` | `1.0` | 未收到 `capture_ack` 时重发 `capture=1` 的间隔（秒） |
 | `tracking.send_interval` | `0.1` | 普通跟踪/对准指令（capture=0）的最小发送间隔（秒）；capture=1 与阶段切换等事件包立即发送 |
@@ -433,7 +439,10 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 即使偏移量很大，底盘目标也会被 `CHASSIS_RAMP_STEP_MM` 逐帧逼近，
 避免一次执行全量偏移导致过冲发散。
 `capture=1` 表示执行当前动作（抓取或松爪放置）。若某帧像素坐标无法换算成有效运动量，
-上位机会沿用上一帧有效指令，避免误发全 0 导致下位机误判为停止。
+上位机会沿用上一帧有效指令，避免误发全 0 导致下位机误判为停止。发送 `capture=1` 的
+触发帧中，底盘 x/y 会被改写为下位机当前回传位置，不再携带视觉算出的残余位移目标，
+避免动作开始时底盘继续挪动那几毫米；下位机固件若在 `capture=1` 时忽略底盘字段、直接
+在本位置执行动作，效果会更干净。
 
 #### 底盘 → 上位机（GimbalToVision，17 字节）
 

@@ -7,6 +7,7 @@
 """
 
 import cv2
+import math
 import numpy as np
 import time
 import yaml
@@ -40,6 +41,16 @@ MIN_RING_AREA = _place_float("min_ring_area", 300)            # 圆环最小面�
 RING_CIRCULARITY = _place_float("ring_circularity", 0.6)      # 圆环圆度下限
 MIN_DIGIT_CONFIDENCE = _place_float("min_digit_confidence", 0.8)  # 数字置信度下限
 RING_GROUP_OVERLAP = _place_float("ring_group_overlap", 0.8)  # 同心圆分组判定系数
+RING_ROI_MARGIN_RATIO = _place_float("ring_roi_margin_ratio", 0.5)  # 圆心距 ROI 边界最小距离（相对半径）
+RING_FIT_MAX_RESIDUAL_PX = _place_float("ring_fit_max_residual_px", 4.0)  # 圆拟合平均残差上限(px)
+# HoughCircles 修正圆心（可选）：与轮廓候选匹配时用 Hough 圆心替换 minEnclosingCircle 圆心
+RING_HOUGH_ENABLED = bool(_PLACE_CFG.get("ring_hough_enabled", False))
+HOUGH_MIN_RADIUS = int(_PLACE_CFG.get("hough_min_radius", 25))
+HOUGH_MAX_RADIUS = int(_PLACE_CFG.get("hough_max_radius", 60))
+HOUGH_MIN_DIST = _place_float("hough_min_dist", 90)
+HOUGH_PARAM1 = _place_float("hough_param1", 100)
+HOUGH_PARAM2 = _place_float("hough_param2", 30)
+HOUGH_MATCH_PX = _place_float("hough_match_px", 15)
 MORPH_KERNEL_SIZE = int(_PLACE_CFG.get("morph_kernel_size", 5))  # 闭运算核大小
 MIN_CROP_PX = _place_float("min_crop_px", 12)                 # 数字裁剪最小半径（px）
 DEBUG = bool(_PLACE_CFG.get("debug", False))                  # true=打印识别调试日志
@@ -65,6 +76,107 @@ def _debug_throttle(interval_s=1.0):
     return True
 
 
+def _fit_circle_lls(points):
+    """
+    对轮廓点做最小二乘圆拟合（Kasa 法）。
+
+    返回 (center, radius, mean_residual)：
+      center: (x, y)
+      radius: 拟合半径
+      mean_residual: 各点到拟合圆的平均径向误差(px)
+    点太少或退化时返回 None。
+
+    相比 minEnclosingCircle，圆拟合对残缺/带噪轮廓的圆心估计更稳，
+    圆心不会因为轮廓边缘少一块就往旁边漂。
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) < 8:
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    xm = float(x.mean())
+    ym = float(y.mean())
+    u = x - xm
+    v = y - ym
+
+    suu = float(np.sum(u * u))
+    svv = float(np.sum(v * v))
+    suv = float(np.sum(u * v))
+    suuu = float(np.sum(u ** 3))
+    svvv = float(np.sum(v ** 3))
+    suvv = float(np.sum(u * v * v))
+    svuu = float(np.sum(v * u * u))
+
+    det = suu * svv - suv * suv
+    if abs(det) < 1e-9:
+        return None
+    cx = (0.5 * (suuu + suvv) * svv - 0.5 * (svvv + svuu) * suv) / det
+    cy = (suu * 0.5 * (svvv + svuu) - suv * 0.5 * (suuu + suvv)) / det
+    center = (cx + xm, cy + ym)
+    radii = np.hypot(u - cx, v - cy)
+    radius = float(radii.mean())
+    residual = float(np.abs(radii - radius).mean())
+    return center, radius, residual
+
+
+def _hough_refine_centers(gray, candidates, roi):
+    """
+    用 HoughCircles 修正候选圆环的圆心：
+    在 ROI（未配置时为整幅图像）内检测圆，若与某个轮廓候选圆心距离
+    小于 HOUGH_MATCH_PX，则用 Hough 圆心/半径替换轮廓候选的圆心/半径。
+
+    Hough 由多个边缘点投票，圆被遮挡/裁掉一部分时圆心仍然稳定，
+    可作为轮廓法圆拟合的补充（config.yaml → placement.ring_hough_enabled）。
+    """
+    if not candidates:
+        return candidates
+    region = roi if roi is not None else [0, 0, gray.shape[1], gray.shape[0]]
+    rx, ry, rw, rh = (int(v) for v in region)
+    if rw <= 0 or rh <= 0:
+        return candidates
+    sub = gray[ry:ry + rh, rx:rx + rw]
+    if sub.size == 0:
+        return candidates
+    blurred = cv2.medianBlur(sub, 5)
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.0,
+        minDist=HOUGH_MIN_DIST,
+        param1=HOUGH_PARAM1,
+        param2=HOUGH_PARAM2,
+        minRadius=HOUGH_MIN_RADIUS,
+        maxRadius=HOUGH_MAX_RADIUS,
+    )
+    if circles is None:
+        return candidates
+    circles = np.round(circles[0]).astype(int)
+    used = set()
+    out = []
+    for cand in candidates:
+        cx, cy = cand["center"]
+        best = None
+        best_d = HOUGH_MATCH_PX
+        for hx, hy, hr in circles:
+            key = (int(hx), int(hy))
+            if key in used:
+                continue
+            d = math.hypot(cx - (hx + rx), cy - (hy + ry))
+            if d <= best_d:
+                best = (hx + rx, hy + ry, float(hr))
+                best_d = d
+        if best is not None:
+            used.add((int(best[0] - rx), int(best[1] - ry)))
+            out.append(dict(
+                cand,
+                center=(float(best[0]), float(best[1])),
+                radius=best[2],
+            ))
+        else:
+            out.append(cand)
+    return out
+
+
 class PlacementRecognizer:
     """识别放置区同心圆环及其中心数字。"""
 
@@ -79,6 +191,8 @@ class PlacementRecognizer:
             "area_rejected": 0,
             "circularity_rejected": 0,
             "radius_rejected": 0,
+            "roi_rejected": 0,
+            "fit_rejected": 0,
         }
 
     def find_rings(self, gray, roi=None):
@@ -109,6 +223,8 @@ class PlacementRecognizer:
             "area_rejected": 0,
             "circularity_rejected": 0,
             "radius_rejected": 0,
+            "roi_rejected": 0,
+            "fit_rejected": 0,
         }
         candidates = []
         for cnt in contours:
@@ -125,7 +241,14 @@ class PlacementRecognizer:
                 self.last_ring_debug["circularity_rejected"] += 1
                 continue
 
+            # 圆心优先用最小二乘圆拟合：轮廓残缺/噪声时圆心比
+            # minEnclosingCircle 稳定；拟合残差过大时回退到原方法。
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
+            fit = _fit_circle_lls(cnt)
+            if fit is not None and fit[2] <= RING_FIT_MAX_RESIDUAL_PX:
+                (cx, cy), radius = fit[0], fit[1]
+            else:
+                self.last_ring_debug["fit_rejected"] += 1
             if radius < MIN_RING_RADIUS:
                 self.last_ring_debug["radius_rejected"] += 1
                 continue
@@ -136,15 +259,43 @@ class PlacementRecognizer:
         if not candidates:
             return []
 
-        if roi is not None:
-            rx, ry, rw, rh = (int(v) for v in roi)
-            candidates = [
-                c for c in candidates
-                if rx <= c["center"][0] <= rx + rw
-                and ry <= c["center"][1] <= ry + rh
-            ]
+        # HoughCircles 修正圆心（可选，默认关闭）
+        if RING_HOUGH_ENABLED:
+            candidates = _hough_refine_centers(gray, candidates, roi)
             if not candidates:
                 return []
+
+        # 只保留圆心完整落在 ROI（未配置 ROI 时为整幅图像）内的圆环；
+        # 圆心太靠近边界时，圆环会被裁掉一部分，
+        # minEnclosingCircle 的圆心会向边缘漂移（表现为“圆心跳边”）。
+        # 这种残缺圆环直接丢弃，只保留完整落在 ROI 内的圆环。
+        region = roi if roi is not None else [0, 0, gray.shape[1], gray.shape[0]]
+        rx, ry, rw, rh = (int(v) for v in region)
+        in_region = []
+        for c in candidates:
+            cx, cy = c["center"]
+            if rx <= cx <= rx + rw and ry <= cy <= ry + rh:
+                in_region.append(c)
+
+        kept = []
+        for c in in_region:
+            cx, cy = c["center"]
+            margin = c["radius"] * RING_ROI_MARGIN_RATIO
+            if (
+                rx + margin <= cx <= rx + rw - margin
+                and ry + margin <= cy <= ry + rh - margin
+            ):
+                kept.append(c)
+            else:
+                self.last_ring_debug["roi_rejected"] += 1
+
+        # 全部都被边界裁剪过滤时退回区域内候选，避免唯一可用圆环被误杀后卡死；
+        # 残留的边缘误检仍由 src.py 的圆心连续性校验拦截。
+        candidates = kept
+        if not candidates:
+            candidates = in_region
+        if not candidates:
+            return []
 
         # 同心圆环按中心距离分组，每组取半径最小的（最内层圆环）
         candidates.sort(key=lambda c: c["radius"])
@@ -383,7 +534,9 @@ class PlacementRecognizer:
                 if not all_rings:
                     print(f"[放置调试] 圆环被过滤: 轮廓={d['contours']}, "
                           f"面积淘汰={d['area_rejected']}, 圆度淘汰={d['circularity_rejected']}, "
-                          f"半径淘汰={d['radius_rejected']}")
+                          f"半径淘汰={d['radius_rejected']}, "
+                          f"ROI边缘淘汰={d['roi_rejected']}, "
+                          f"圆拟合回退={d['fit_rejected']}")
                 elif not digits_ok:
                     print(f"[放置调试] 数字未通过: 需为1~3且置信度≥{MIN_DIGIT_CONFIDENCE:.2f} "
                           f"（检查数字是否完整在圆环中心、裁剪是否合适）")

@@ -102,6 +102,16 @@ GRAB_CENTER_TOLERANCE_Y_PX = float(
 PLACE_CENTER_TOLERANCE_Y_PX = float(
     _cfg("control", "place_center_tolerance_y_px", default=PLACE_CENTER_TOLERANCE_PX)
 )
+# 抓取区“开始识别时第一目标已在场”跳过逻辑：
+# 到达抓取区开始识别时（只针对本轮第一个目标），若开始识别后的前几帧内
+# 就检测到第一目标颜色，说明复位期间它已经/正在转走，来不及抓；
+# 本圈不跟踪不抓取，等它转一圈重新出现后再按正常流程抓取。
+GRAB_SKIP_FIRST_ENABLED = bool(
+    _cfg("control", "grab_skip_first_enabled", default=True)
+)
+GRAB_SKIP_FIRST_EVAL_FRAMES = int(
+    _cfg("control", "grab_skip_first_eval_frames", default=5)
+)
 
 # ==================== 指令发送节流/死区/心跳（config.yaml → tracking） ====================
 # 等待抓取时，若下位机未回传 capture_ack=1，每隔该秒数重发一次 capture=1
@@ -243,6 +253,20 @@ PLACEMENT_ORDER_LOG = str(_cfg(
 # 放置阶段位置稳定条件（config.yaml → placement）
 PLACE_STABLE_THRESHOLD = int(_cfg("placement", "place_stable_threshold", default=30))
 PLACE_STABLE_MAX_MOVE = float(_cfg("placement", "place_stable_max_pixel_move", default=20.0))
+# 放置阶段圆心 EMA 平滑系数（0~1）：越大越跟手，越小越抗识别抖动。
+# 识别偶发跳边时只被衰减，不会像“丢弃帧”那样把车辆完全卡住。
+PLACE_CENTER_SMOOTH_ALPHA = float(
+    _cfg("placement", "place_center_smooth_alpha", default=0.5)
+)
+PLACE_CENTER_SMOOTH_ALPHA = min(1.0, max(0.05, PLACE_CENTER_SMOOTH_ALPHA))
+# 放置阶段视觉误差增益（0~1）：目标位置 = 回传位置 + 视觉误差 × 增益。
+# 降增益让底盘只响应持续存在的偏差，避免单帧识别噪声被全量放大成大幅指令。
+PLACE_VISUAL_GAIN = float(_cfg("placement", "place_visual_gain", default=0.5))
+PLACE_VISUAL_GAIN = min(1.0, max(0.05, PLACE_VISUAL_GAIN))
+# 放置阶段底盘指令变化死区（mm），比全局死区大，过滤小幅识别抖动
+PLACE_CHASSIS_DEADBAND_MM = float(
+    _cfg("placement", "place_chassis_deadband_mm", default=5.0)
+)
 
 # ==================== 托盘阶段（config.yaml → placement） ====================
 # 放置完成后进入托盘阶段：复用抓取阶段的视觉跟踪逻辑；
@@ -864,8 +888,9 @@ def main():
     tray_pending_digit = None   # 托盘阶段当前正在抓取的 target（已到达托盘，等待抓取完成）
     tray_pending_slot = None    # 当前托盘对应物块的放置目标槽位（下位机 target 用）
     place_stable_count = 0      # 放置阶段位置稳定计数（连续同圆环且位移小）
-    place_last_center = None    # 放置阶段上一帧选中圆环中心
+    place_last_center = None    # 放置阶段上一帧平滑后的圆环中心
     place_last_digit = None     # 放置阶段上一帧选中圆环数字
+    place_smooth_center = None  # 放置阶段圆心 EMA 平滑状态
     placement_recognizer = None
     last_place_dbg = 0.0          # 放置发送调试日志节流
     last_worldkf_print = 0.0      # 世界系卡尔曼终端调试打印节流
@@ -888,6 +913,12 @@ def main():
     last_kf_time = None              # 上一帧 KF 更新时间（用于按实际帧间隔更新 dt）
     # 最近一次有效的底盘/夹爪指令；pixel_to_camera 失效时沿用，避免误发 0
     last_valid_mm = (0, 0, 0)
+    # 抓取区“开始识别时第一目标已在场”跳过逻辑状态
+    grab_skip_first_checked = False    # 本次抓取区“第一目标已在场”判定是否已完成
+    grab_skip_first_active = False     # 已判定第一目标在场，本圈跳过，等下一圈
+    grab_skip_first_miss_seen = False  # 跳过期间是否已看到目标真正离开画面
+    grab_skip_first_fake_miss = False  # 本帧目标可见但被有意忽略（不是真消失）
+    grab_skip_first_eval_left = 0      # 开始识别后的判定窗口剩余帧数
 
     # 上一个检测到的物块信息（等待阶段重绘用）
     last_detected_center = None
@@ -905,6 +936,9 @@ def main():
         nonlocal last_tracking_send, last_sent_tracking_mm
         nonlocal last_smooth_cmd_mm, last_smooth_time
         nonlocal last_valid_mm, last_kf_time
+        nonlocal grab_skip_first_checked, grab_skip_first_active
+        nonlocal grab_skip_first_miss_seen, grab_skip_first_fake_miss
+        nonlocal grab_skip_first_eval_left
         waiting_for_next = False
         detector.reset()
         kf.reset()
@@ -922,6 +956,11 @@ def main():
         last_kf_time = None
         last_detected_center = None
         last_valid_mm = (0, 0, 0)
+        grab_skip_first_checked = False
+        grab_skip_first_active = False
+        grab_skip_first_miss_seen = False
+        grab_skip_first_fake_miss = False
+        grab_skip_first_eval_left = 0
         if target_index + 1 < len(target_colors):
             target_index += 1
             print(f"[{reason}] 切换到目标 {target_index + 1}/{len(target_colors)}")
@@ -937,7 +976,11 @@ def main():
         nonlocal last_valid_mm, last_detected_center, last_detection_time, last_kf_time
         nonlocal recognition_started
         nonlocal place_stable_count, place_last_center, place_last_digit
+        nonlocal place_smooth_center
         nonlocal gripper_settle_target_mm, gripper_settle_started, gripper_settle_done
+        nonlocal grab_skip_first_checked, grab_skip_first_active
+        nonlocal grab_skip_first_miss_seen, grab_skip_first_fake_miss
+        nonlocal grab_skip_first_eval_left
         detection_sent = False
         waiting_for_next = False
         sent_time = None
@@ -959,7 +1002,13 @@ def main():
         recognition_started = False
         place_stable_count = 0
         place_last_center = None
+        place_smooth_center = None
         place_last_digit = None
+        grab_skip_first_checked = False
+        grab_skip_first_active = False
+        grab_skip_first_miss_seen = False
+        grab_skip_first_fake_miss = False
+        grab_skip_first_eval_left = 0
         detector.reset()
         kf.reset()
         kwf.reset()
@@ -1138,13 +1187,15 @@ def main():
             return True
         return False
 
-    def tracking_send_allowed(capture, cmd_mm):
+    def tracking_send_allowed(capture, cmd_mm, deadband_mm=None):
         """
         普通 capture=0 包按“最小间隔 + 变化死区 + 心跳”节流；
         capture=1 立即发送。
         """
         nonlocal last_tracking_send, last_sent_tracking_mm
         now = time.time()
+        if deadband_mm is None:
+            deadband_mm = CHASSIS_SEND_DEADBAND_MM
         if capture:
             last_tracking_send = now
             last_sent_tracking_mm = cmd_mm
@@ -1160,8 +1211,8 @@ def main():
 
         # 底盘变化量（目标偏移变化超过发送死区才需要再修正）
         chassis_changed = (
-            abs(cmd_mm[0] - last_sent_tracking_mm[0]) >= CHASSIS_SEND_DEADBAND_MM
-            or abs(cmd_mm[1] - last_sent_tracking_mm[1]) >= CHASSIS_SEND_DEADBAND_MM
+            abs(cmd_mm[0] - last_sent_tracking_mm[0]) >= deadband_mm
+            or abs(cmd_mm[1] - last_sent_tracking_mm[1]) >= deadband_mm
         )
         gripper_changed = (
             abs(cmd_mm[2] - last_sent_tracking_mm[2]) >= GRIPPER_DEADBAND_MM
@@ -1252,6 +1303,7 @@ def main():
                     tray_pending_digit = None
                     place_stable_count = 0
                     place_last_center = None
+                    place_smooth_center = None
                     place_last_digit = None
                     grabbed_slots = set()
                     placed_block_slots = set()   # 已放置过的槽位：再次夹取时物块已躺倒
@@ -1885,18 +1937,43 @@ def main():
                                 break
                             continue
 
-                        # 多个圆环同时可见时，优先选择离图像中心最近（当前下位机所在位置）的圆环
-                        target = min(
-                            candidates,
-                            key=lambda r: (
-                                (r["center"][0] - w_img / 2.0) ** 2
-                                + (r["center"][1] - h_img / 2.0) ** 2
-                            ),
-                        )
+                        # 多个圆环同时可见时，优先选择离图像中心最近（当前下位机所在位置）的圆环；
+                        # 若上一帧已锁定同一数字的圆环，则优先沿用其圆心附近的候选，
+                        # 避免识别在相邻圆环/边缘残缺圆环之间来回切换（圆心跳边）。
+                        if place_last_center is not None and place_last_digit == digit:
+                            target = min(
+                                candidates,
+                                key=lambda r: (
+                                    (r["center"][0] - place_last_center[0]) ** 2
+                                    + (r["center"][1] - place_last_center[1]) ** 2
+                                ),
+                            )
+                        else:
+                            target = min(
+                                candidates,
+                                key=lambda r: (
+                                    (r["center"][0] - w_img / 2.0) ** 2
+                                    + (r["center"][1] - h_img / 2.0) ** 2
+                                ),
+                            )
                         digit = target["digit"]
                         slot_index = slot_of_place_digit[digit]
                         ring_cx, ring_cy = target["center"]
-                        ring_cx, ring_cy = int(ring_cx), int(ring_cy)
+                        # 对圆心做轻量 EMA 平滑：识别偶发跳边只被衰减，
+                        # 不会像“丢弃帧”那样把车辆完全卡住；切换数字时重新初始化。
+                        if place_smooth_center is None or place_last_digit != digit:
+                            place_smooth_center = (float(ring_cx), float(ring_cy))
+                        else:
+                            place_smooth_center = (
+                                PLACE_CENTER_SMOOTH_ALPHA * ring_cx
+                                + (1.0 - PLACE_CENTER_SMOOTH_ALPHA) * place_smooth_center[0],
+                                PLACE_CENTER_SMOOTH_ALPHA * ring_cy
+                                + (1.0 - PLACE_CENTER_SMOOTH_ALPHA) * place_smooth_center[1],
+                            )
+                        ring_cx, ring_cy = (
+                            int(round(place_smooth_center[0])),
+                            int(round(place_smooth_center[1])),
+                        )
 
                         cv2.circle(frame, (ring_cx, ring_cy), int(target["radius"]),
                                    (255, 0, 255), 2)
@@ -1979,9 +2056,14 @@ def main():
                             ):
                                 # 放置时夹爪固定（min/max/自定义 mm）：只调底盘
                                 gripper_mm = PLACE_GRIPPER_MM
-                            # 绝对目标：目标位置 = 回传位置 + 视觉误差
-                            chassis_x_mm = int(round(chassis_x + chassis_x_mm))
-                            chassis_y_mm = int(round(chassis_y + chassis_y_mm))
+                            # 绝对目标：目标位置 = 回传位置 + 视觉误差 × 增益。
+                            # 增益 < 1 时只把偏差修正一部分，底盘响应更平稳。
+                            chassis_x_mm = int(round(
+                                chassis_x + chassis_x_mm * PLACE_VISUAL_GAIN
+                            ))
+                            chassis_y_mm = int(round(
+                                chassis_y + chassis_y_mm * PLACE_VISUAL_GAIN
+                            ))
                             chassis_x_mm, chassis_y_mm, gripper_mm = sanitize_protocol_mm(
                                 (chassis_x_mm, chassis_y_mm, gripper_mm), last_valid_mm
                             )
@@ -1997,24 +2079,33 @@ def main():
                                 "放置", ring_cx, ring_cy, w_img, h_img
                             )
 
+                        # capture=1 触发帧不携带残余底盘位移：
+                        # 底盘字段改写为下位机当前回传位置，动作只在本位置执行，
+                        # 避免下位机收到动作请求后继续走完剩余几毫米目标。
+                        send_x_mm, send_y_mm = chassis_x_mm, chassis_y_mm
+                        if capture:
+                            send_x_mm = int(round(chassis_x))
+                            send_y_mm = int(round(chassis_y))
+
                         vg = VisionToGimbal(
                             target=slot_index,
                             number=digit,
                             action=PLACE_ACTION,
                             capture=capture,
-                            chassis_x_mm=chassis_x_mm,
-                            chassis_y_mm=chassis_y_mm,
+                            chassis_x_mm=send_x_mm,
+                            chassis_y_mm=send_y_mm,
                             gripper_mm=gripper_mm,
                         )
                         sent = tracking_send_allowed(
                             capture,
-                            (chassis_x_mm, chassis_y_mm, gripper_mm),
+                            (send_x_mm, send_y_mm, gripper_mm),
+                            deadband_mm=PLACE_CHASSIS_DEADBAND_MM,
                         )
                         if sent:
                             enqueue_latest(q, vg)
                             log_command(
                                 "放置", slot_index, digit, PLACE_ACTION, capture,
-                                chassis_x_mm, chassis_y_mm, gripper_mm,
+                                send_x_mm, send_y_mm, gripper_mm,
                                 chassis_x, chassis_y, chassis_vx, chassis_vy,
                                 fb_gripper_mm=fb_gripper_mm,
                                 camera_coord=coord,
@@ -2116,6 +2207,14 @@ def main():
                                 "[识别] 开始抓取区识别"
                                 f"（等待 arrived: {'是' if waiting_for_arrive else '否'}）"
                             )
+                        # 抓取区第一个目标：初始化“第一目标已在场”判定窗口
+                        if (GRAB_SKIP_FIRST_ENABLED and not tray_phase_active
+                                and target_index == 0):
+                            grab_skip_first_checked = False
+                            grab_skip_first_active = False
+                            grab_skip_first_miss_seen = False
+                            grab_skip_first_fake_miss = False
+                            grab_skip_first_eval_left = GRAB_SKIP_FIRST_EVAL_FRAMES
                     current_time = cv2.getTickCount()
                     # 按 QR 顺序只检测当前目标颜色，避免每帧构建 6 种颜色掩膜
                     current_target_code = target_colors[target_index]
@@ -2138,6 +2237,48 @@ def main():
                             data = None
                             current_center = None
                             current_color = None
+
+                    # ---- “开始识别时第一目标已在场”跳过逻辑（仅抓取区第一个目标） ----
+                    # 到达抓取区开始识别时，若判定窗口内就检测到第一目标颜色，
+                    # 说明复位期间它已经/正在转走，本圈不跟踪不抓取；
+                    # 等它真正离开画面、下一圈重新出现后再按正常流程抓取。
+                    if (GRAB_SKIP_FIRST_ENABLED and not tray_phase_active
+                            and target_index == 0):
+                        if not grab_skip_first_checked:
+                            if grab_skip_first_eval_left > 0:
+                                grab_skip_first_eval_left -= 1
+                                if data and current_color:
+                                    print(
+                                        f"[跳过本圈] 开始识别时第一目标颜色"
+                                        f"{current_color}已在场，本圈不抓，"
+                                        "等它转回来"
+                                    )
+                                    grab_skip_first_checked = True
+                                    grab_skip_first_active = True
+                                    grab_skip_first_miss_seen = False
+                                    data = None
+                                    current_center = None
+                                    current_color = None
+                                    grab_skip_first_fake_miss = True
+                            else:
+                                # 判定窗口结束仍没看到第一目标：按正常流程
+                                grab_skip_first_checked = True
+                        elif grab_skip_first_active:
+                            if data and current_color:
+                                if grab_skip_first_miss_seen:
+                                    # 已真正离开过画面，这是下一圈：恢复正常
+                                    grab_skip_first_active = False
+                                    grab_skip_first_miss_seen = False
+                                    print(
+                                        f"[恢复跟踪] 第一目标颜色{current_color}转回来了，"
+                                        "按正常流程抓取"
+                                    )
+                                else:
+                                    # 同一圈内继续忽略本帧（不更新检测/滤波/发送）
+                                    data = None
+                                    current_center = None
+                                    current_color = None
+                                    grab_skip_first_fake_miss = True
 
                     if data and current_color:
                         last_detection_time = current_time
@@ -2675,22 +2816,29 @@ def main():
                                     (0, 200, 255), 1,
                                 )
 
+                            # capture=1 触发帧不携带残余底盘位移：
+                            # 底盘字段改写为下位机当前回传位置，动作只在本位置执行。
+                            send_x_mm, send_y_mm = chassis_x_mm, chassis_y_mm
+                            if capture:
+                                send_x_mm = int(round(chassis_x))
+                                send_y_mm = int(round(chassis_y))
+
                             vg = VisionToGimbal(
                                 target=slot_index,
                                 action=GRAB_ACTION,
                                 capture=capture,
-                                chassis_x_mm=chassis_x_mm,
-                                chassis_y_mm=chassis_y_mm,
+                                chassis_x_mm=send_x_mm,
+                                chassis_y_mm=send_y_mm,
                                 gripper_mm=gripper_mm,
                             )
                             if tracking_send_allowed(
                                 capture,
-                                (chassis_x_mm, chassis_y_mm, gripper_mm),
+                                (send_x_mm, send_y_mm, gripper_mm),
                             ):
                                 enqueue_latest(q, vg)
                                 log_command(
                                     "抓取", slot_index, 0, GRAB_ACTION, capture,
-                                    chassis_x_mm, chassis_y_mm, gripper_mm,
+                                    send_x_mm, send_y_mm, gripper_mm,
                                     chassis_x, chassis_y, chassis_vx, chassis_vy,
                                     fb_gripper_mm=fb_gripper_mm,
                                     camera_coord=block_camera_coord,
@@ -2737,6 +2885,18 @@ def main():
                     else:
                         # 本帧未识别到目标颜色：颜色计数清零，
                         # 重新出现后必须再连续攒够 color_stable_threshold 帧
+                        target_label = COLOR_LABEL_EN.get(
+                            CODE_TO_KEY.get(current_target_code), current_target_code
+                        )
+                        if grab_skip_first_fake_miss:
+                            # 目标实际还在画面里，只是被“第一目标已在场”逻辑有意忽略，
+                            # 不能当作真正消失（否则会误判为下一圈已到）
+                            grab_skip_first_fake_miss = False
+                            hint_txt = "第一目标已在场，等待下一圈..."
+                        else:
+                            if grab_skip_first_active:
+                                grab_skip_first_miss_seen = True
+                            hint_txt = f"Looking for {target_label}..."
                         detector.on_miss()
                         # 同步重置平滑状态，恢复识别后从 0 重新小步爬升，
                         # 避免用断帧前/后的陈旧时间差一次性补大步。
@@ -2746,11 +2906,7 @@ def main():
                         last_smooth_time = time.time()
                         last_sent_tracking_mm = None
 
-                        # 未检测到物块，显示提示
-                        target_label = COLOR_LABEL_EN.get(
-                            CODE_TO_KEY.get(current_target_code), current_target_code
-                        )
-                        cv2.putText(frame, f"Looking for {target_label}...",
+                        cv2.putText(frame, hint_txt,
                                     (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                         if last_detection_time is not None:
                             elapsed = (current_time - last_detection_time) / cv2.getTickFrequency() * 1000

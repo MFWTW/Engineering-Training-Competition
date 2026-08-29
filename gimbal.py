@@ -3,7 +3,9 @@ import threading
 import struct
 import time
 import logging
+import os
 from typing import List, Optional
+from serial.tools import list_ports
 
 # 小端: head(2B) target(1B) number(1B) action(1B) capture(1B)
 #       chassis_x(2B) chassis_y(2B) gripper(2B) tail(2B)
@@ -11,6 +13,39 @@ PACK_FORMAT = "<2B B B B B h h H 2B"
 PACK_SIZE = struct.calcsize(PACK_FORMAT)  # 14 字节
 
 logger = logging.getLogger("Gimbal")
+
+
+def detect_serial_port(preferred: Optional[str] = None) -> Optional[str]:
+    """自动识别可用串口设备。
+
+    优先使用指定/默认端口；若该端口不存在，则从系统枚举的串口中
+    挑选第一个 USB 串口（/dev/ttyACM*、/dev/ttyUSB* 等）作为候选。
+    识别不到任何串口时返回 None，由调用方决定是否退出。
+    """
+    ports = list_ports.comports()
+
+    # 1) 指定端口存在 → 直接用
+    if preferred:
+        if any(p.device == preferred for p in ports) or os.path.exists(preferred):
+            return preferred
+
+    # 2) 枚举到的串口里，优先 USB 串口类设备
+    def _score(port_info) -> int:
+        low = port_info.device.lower()
+        if low.startswith("/dev/ttyacm") or low.startswith("/dev/ttyusb"):
+            return 0
+        if port_info.vid is not None or (
+            port_info.description and "usb" in port_info.description.lower()
+        ):
+            return 1
+        return 2
+
+    if ports:
+        best = min(ports, key=_score)
+        return best.device
+
+    # 3) 没枚举到任何串口，退回指定端口，让 open() 给出明确失败信息
+    return preferred
 
 
 class VisionToGimbal:
@@ -120,8 +155,9 @@ class GimbalToVision:
 
 
 class SerialComm:
-    def __init__(self, port: str = "/dev/ttyACM0", baudrate: int = 115200, max_retry: int = 10, retry_delay: float = 1.0):
-        self.port = port
+    def __init__(self, port: Optional[str] = "/dev/ttyACM0", baudrate: int = 115200,
+                 max_retry: int = 10, retry_delay: float = 1.0, auto_detect: bool = True):
+        self.port = port or "/dev/ttyACM0"
         self.baudrate = baudrate
         self.max_retry = max_retry
         self.retry_delay = retry_delay
@@ -136,7 +172,14 @@ class SerialComm:
         self._latest_chassis: Optional[GimbalToVision] = None
         self._chassis_lock = threading.Lock()
 
-        #初始化尝试打开串口
+        # 先识别可用串口（找不到就退回默认端口，让 open() 报明确错误）
+        if auto_detect:
+            detected = detect_serial_port(self.port)
+            if detected and detected != self.port:
+                logger.info(f"[Gimbal] 自动识别串口: {self.port} -> {detected}")
+                self.port = detected
+
+        # 初始化尝试打开串口
         self.open()
         # self.ser: serial.Serial = serial.Serial(port, baudrate, timeout=0.5)
         # self.packet: VisionToGimbal = VisionToGimbal()

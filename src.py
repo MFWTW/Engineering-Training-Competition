@@ -795,6 +795,25 @@ def main():
     global C_1, C_2, chassis_x, chassis_y, chassis_vx, chassis_vy
     global _serial_comm
 
+    # ==================== 第一步：先识别并打开串口 ====================
+    # 只有串口识别并打开成功才继续运行主程序；失败直接退出，不进入主流程
+    try:
+        _serial_comm = SerialComm()
+    except Exception as e:
+        print(f"串口打开异常: {e}")
+        _serial_comm = None
+
+    if _serial_comm is None or not _serial_comm.connected_:
+        print("未识别/打开串口失败，主程序不启动。")
+        print("请检查下位机串口连接（如 /dev/ttyACM0、/dev/ttyUSB0）后重新运行。")
+        _serial_comm = None
+        return
+
+    print(f"串口识别并打开成功：{_serial_comm.port} @ {_serial_comm.baudrate}")
+    _serial_comm.start_chassis_recv()
+    print("底盘接收线程已启动")
+
+    # ==================== 第二步：打开 USB 摄像头 ====================
     # 两台 USB 免驱摄像头：cap 用于二维码扫描，detection_cap 用于物块检测/放置
     cap = open_camera(
         QR_CAMERA_SOURCE,
@@ -802,6 +821,8 @@ def main():
         height=DETECTION_FRAME_HEIGHT,
     )
     if cap is None:
+        _serial_comm.stop_chassis_recv()
+        _serial_comm.close()
         return
 
     detection_cap = open_camera(
@@ -814,18 +835,12 @@ def main():
         print("未检测到物块检测 USB 摄像头，退出")
         if cap:
             cap.release()
+        _serial_comm.stop_chassis_recv()
+        _serial_comm.close()
         return
 
     q = queue.Queue(maxsize=1)
 
-    # 创建串口 + 启动底盘接收线程
-    try:
-        _serial_comm = SerialComm()
-        _serial_comm.start_chassis_recv()
-        print("串口已打开，底盘接收线程已启动")
-    except Exception as e:
-        print(f"串口打开失败: {e}")
-        _serial_comm = None
     if CHASSIS_LOOKAHEAD_S > 0.0:
         print(
             f"[配置] 底盘前瞻已开启：{CHASSIS_LOOKAHEAD_S * 1000.0:.0f}ms"

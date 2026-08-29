@@ -393,6 +393,12 @@ PLANNER_TOLERANCE = float(_cfg("planner", "tolerance_s", default=0.1))
 # ==================== ROI 配置 ====================
 # ROI 区域在 config.yaml 的 detection.detection_area 中配置（[x, y, w, h]，None=全图），
 # 由 felling_color.BlockDetector 自动读取，主循环中会做边界修正并绘制。
+# detection_area_after_first：放置/托盘阶段使用的另一个 ROI；
+# None=不切换（各阶段都用 detection_area）。
+DETECTION_AREA_FIRST = _cfg("detection", "detection_area", default=None)
+DETECTION_AREA_AFTER_FIRST = _cfg(
+    "detection", "detection_area_after_first", default=None
+)
 
 # ==================== 全局变量 ====================
 C_1 = None
@@ -886,8 +892,6 @@ def main():
         max_predict_time=PLANNER_MAX_PREDICT_TIME,
         tolerance=PLANNER_TOLERANCE,
     )
-
-    roi_clamped = False  # ROI 只修正一次
 
     detection_sent = False
     waiting_for_next = False    # 已请求抓取，等待下位机 finish_capture 或手动切换
@@ -1944,15 +1948,32 @@ def main():
                 if frame is not None:
                     h_img, w_img = frame.shape[:2]
 
-                    # 修正 ROI（仅首次），后续直接绘制
-                    if not roi_clamped and detector.detection_area is not None:
-                        detector.detection_area = clamp_roi(detector.detection_area, frame.shape)
-                        roi_clamped = True
-                    if detector.detection_area is not None:
-                        rx, ry, rw, rh = detector.detection_area
-                        cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
-                        cv2.putText(frame, "ROI", (rx + 5, ry + 25),
+                    # 抓取区阶段（每轮所有物块抓取）用 detection_area；
+                    # 放置/托盘阶段（含前往放置区的路上）用 detection_area_after_first。
+                    at_placement_area = (
+                        tray_phase_active
+                        or phase == PLACE_ACTION
+                        or (
+                            waiting_for_arrive
+                            and phase_after_arrival == PLACE_ACTION
+                        )
+                    )
+                    if at_placement_area and DETECTION_AREA_AFTER_FIRST is not None:
+                        active_roi = DETECTION_AREA_AFTER_FIRST
+                        roi_label = "ROI2"
+                    else:
+                        active_roi = DETECTION_AREA_FIRST
+                        roi_label = "ROI"
+                    if active_roi is not None:
+                        active_roi = clamp_roi(active_roi, frame.shape)
+                        detector.detection_area = active_roi
+                        rx, ry, rw, rh = active_roi
+                        cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh),
+                                      (0, 255, 0), 2)
+                        cv2.putText(frame, roi_label, (rx + 5, ry + 25),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    else:
+                        detector.detection_area = None
 
                     # 显示 QR 和状态
                     if scan_QRcode_andlist.groups:

@@ -358,7 +358,8 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `detection.blur` | `5 / 2 / 2` | 高斯模糊核与 σ |
 | `detection.stability.*` | 见 YAML | 物块位置稳定帧数 / 位移容忍 / 颜色连续稳定帧数 |
 | `detection.timeout_ms` | `100` | 检测超时（ms） |
-| `detection.detection_area` | `null` | 检测区域 `[x, y, w, h]`（原 `DETECTION_ROI`），`null` 为关闭 ROI（全图）；当前仅用于可视化，检测为全图 |
+| `detection.detection_area` | `null` | 检测区域 `[x, y, w, h]`（原 `DETECTION_ROI`），`null` 为关闭 ROI（全图）；抓取/放置检测均只在该区域内找物块 |
+| `detection.detection_area_after_first` | `null` | 放置/托盘阶段（放置区识别圆环、托盘抓取物块）使用的另一个检测区域 `[x, y, w, h]`；抓取区抓取物块仍用 `detection_area`；`null` 表示不切换 |
 
 性能说明：调用 `detect(frame, target_code=...)` 时只构建目标颜色的 HSV 掩膜
 （普通颜色 1 次 `inRange`，红色双区间 2 次），不再每帧构建 6 色掩膜；

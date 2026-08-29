@@ -134,6 +134,14 @@ detection:
   - 170
   - 230
   - 190
+  # 放置/托盘阶段（放置区识别圆环、托盘抓取物块）使用的检测区域
+  # [x, y, w, h]；null = 不切换，各阶段都用 detection_area。
+  # 抓取区抓取物块时仍使用上面的 detection_area。
+  detection_area_after_first:
+  - 140
+  - 130
+  - 360
+  - 190
   # 颜色掩膜形态学核大小（px）
   kernel_size: 3
   blur:

@@ -267,12 +267,19 @@ PLACE_VISUAL_GAIN = min(1.0, max(0.05, PLACE_VISUAL_GAIN))
 PLACE_CHASSIS_DEADBAND_MM = float(
     _cfg("placement", "place_chassis_deadband_mm", default=5.0)
 )
-
+# true=到达放置区后先拿最近可见圆环（如数字 2）调整车的位置
+# （只发跟踪 capture=0，不发 capture=1）；调整完成后，
+# 若它不是当前应放数字，再发送应放数字（如 1），由下位机前往对应圆环放置。
+PLACE_PREALIGN_ENABLED = bool(
+    _cfg("placement", "place_prealign_enabled", default=True)
+)
 # ==================== 托盘阶段（config.yaml → placement） ====================
 # 放置完成后进入托盘阶段：复用抓取阶段的视觉跟踪逻辑；
-# 抓取顺序由 tray_phase_order 决定：actual=按实际放置顺序，reverse=倒序。
+# 抓取顺序由 tray_phase_order 决定：actual=按实际放置顺序；放置顺序已固定为
+# 二维码放置序列（如 132），因此 actual 等价于按抓取颜色顺序（如 345）抓回。
+# reverse=按实际放置顺序倒序。
 TRAY_PHASE_ENABLED = bool(_cfg("placement", "tray_phase_enabled", default=True))
-TRAY_PHASE_ORDER = str(_cfg("placement", "tray_phase_order", default="reverse")).strip().lower()
+TRAY_PHASE_ORDER = str(_cfg("placement", "tray_phase_order", default="actual")).strip().lower()
 TRAY_PHASE_IS_REVERSE = TRAY_PHASE_ORDER in ("reverse", "reversed", "倒序")
 TRAY_PHASE_ACTION = int(_cfg("placement", "tray_phase_action", default=GRAB_ACTION))
 TRAY_PHASE_CAPTURE = bool(_cfg("placement", "tray_phase_capture", default=True))
@@ -289,6 +296,12 @@ TRAY_PHASE_ARRIVED_MODE = str(
 ).strip().lower()
 TRAY_PHASE_WAIT_ARRIVED = TRAY_PHASE_ARRIVED_MODE not in (
     "none", "immediate", "direct", "直通", "不等待", "不等"
+)
+# 放置完最后一个物块、下位机回传 finish_capture=1 后，延时该秒数再发送
+# 托盘阶段的“前往第一个托盘”移动指令（number=托盘号），给下位机留出
+# 完成动作/稳定时间；0=不延时（原行为，立即发送）。
+TRAY_PHASE_ENTRY_DELAY_S = float(
+    _cfg("placement", "tray_phase_entry_delay_s", default=2.0)
 )
 # 托盘阶段夹爪策略（config.yaml → placement.tray_gripper_fixed）：
 # 倒序托盘阶段保持该策略（dynamic/null=动态调夹爪；min/max/数字mm=固定夹爪长度，
@@ -628,19 +641,14 @@ def append_placement_record(text):
         print(f"[放置记录] 写入失败: {PLACEMENT_ORDER_LOG}: {exc}")
 
 
-def log_tray_order(round_no, cycle_no, placed_order, order_mode="actual"):
-    """按配置的顺序模式生成“托盘阶段”抓取顺序并记录（数字即托盘号）。"""
-    if not placed_order:
+def log_tray_order(round_no, cycle_no, tray_targets, label):
+    """记录托盘阶段抓取顺序（数字即托盘号）。"""
+    if not tray_targets:
         return
-    if order_mode in ("reverse", "reversed", "倒序"):
-        seq = list(reversed(placed_order))
-        label = "倒序"
-    else:
-        seq = list(placed_order)
-        label = "实际顺序"
     line = (
         f"第{round_no}轮 第{cycle_no}遍 托盘阶段：{label}抓取="
-        f"{','.join(map(str, seq))}，对应托盘={','.join(map(str, seq))}"
+        f"{','.join(map(str, tray_targets))}，"
+        f"对应托盘={','.join(map(str, tray_targets))}"
     )
     print(f"[托盘顺序] {line}")
     append_placement_record(line)
@@ -887,12 +895,15 @@ def main():
     tray_plan = []              # 托盘阶段剩余 [(托盘号, 物块颜色), ...]，进入阶段时一次算好
     tray_pending_digit = None   # 托盘阶段当前正在抓取的 target（已到达托盘，等待抓取完成）
     tray_pending_slot = None    # 当前托盘对应物块的放置目标槽位（下位机 target 用）
+    tray_move_delay_until = None  # 进入托盘阶段后，延时发送首条移动指令的到期时间
+    tray_move_delay_vg = None     # 延时待发的“前往第一个托盘”移动指令
     place_stable_count = 0      # 放置阶段位置稳定计数（连续同圆环且位移小）
     place_last_center = None    # 放置阶段上一帧平滑后的圆环中心
     place_last_digit = None     # 放置阶段上一帧选中圆环数字
     place_smooth_center = None  # 放置阶段圆心 EMA 平滑状态
     placement_recognizer = None
     last_place_dbg = 0.0          # 放置发送调试日志节流
+    place_prealign_active = False # 放置区“先用可见圆环调整车的位置”阶段是否激活
     last_worldkf_print = 0.0      # 世界系卡尔曼终端调试打印节流
     last_status_print = 0.0       # 底盘/夹爪状态行打印节流
     target_colors = []          # 当前轮抓取颜色序列（rounds[current_round]["grab"] 的别名）
@@ -1030,6 +1041,7 @@ def main():
         nonlocal waiting_for_arrive, phase, phase_after_arrival, prev_arrived
         nonlocal placed_block_slots, slot_of_place_digit
         nonlocal last_placed_digit, placement_recognizer
+        nonlocal place_prealign_active
 
         repeat = rounds[current_round].get("repeat", 1)
         if round_cycles_done + 1 < repeat:
@@ -1043,7 +1055,7 @@ def main():
             target_index = 0
             placed_digits = set()
             placed_order = []
-            # 本轮第 1 次放置完成：物块已由托盘阶段倒序夹回后部槽位，
+            # 本轮第 1 次放置完成：物块已由托盘阶段按抓取颜色顺序夹回后部槽位，
             # 不再回抓取区，直接前往下一个放置区再次全部放置。
             placed_block_slots.clear()
             place_waiting_arrived = False
@@ -1060,13 +1072,20 @@ def main():
                 prev_arrived = 1
                 reset_action_state()
                 last_placed_digit = None
+                place_prealign_active = PLACE_PREALIGN_ENABLED
                 slot_of_place_digit = {
                     int(d): i + 1
                     for i, d in enumerate(rounds[current_round]["place"])
                 }
                 if placement_recognizer is None:
                     placement_recognizer = PlacementRecognizer()
-                print("已到达放置区，开始识别物料（圆环数字）")
+                print(
+                    "已到达放置区，开始识别物料（圆环数字）"
+                    + (
+                        "；先拿最近可见圆环调整车的位置"
+                        if place_prealign_active else ""
+                    )
+                )
             else:
                 print(f"第 {current_round + 1} 轮第 {round_cycles_done} 次放置完成，"
                       f"前往下一个放置区（物块已夹回后部槽位）")
@@ -1418,12 +1437,21 @@ def main():
                         if chassis_data2.capture_ack and not capture_ack_received:
                             print("[下位机] 已确认动作请求，等待 finish_capture")
                         capture_ack_received = capture_ack_received or bool(chassis_data2.capture_ack)
-                        # finish_capture 0→1 上升沿只触发一次
+                        # 完成判定：优先认 0→1 上升沿；
+                        # 若上升沿在“未等待”期间已被吞掉（fin 提前变 1 并保持），
+                        # 则用“ack 已确认 + fin==1”电平兜底，避免上下位机互相等死。
                         if chassis_data2.finish_capture == 1 and not prev_finish_capture:
                             finish_rising = True
+                        elif capture_ack_received and chassis_data2.finish_capture == 1:
+                            finish_rising = True
+                            print("[下位机] fin 电平兜底触发"
+                                  "（ack 已确认且 fin=1，未等到 0→1 上升沿）")
                         prev_finish_capture = 1 if chassis_data2.finish_capture else 0
                     else:
                         # 未等待时同步当前电平，避免旧电平在下次造成误触发
+                        if chassis_data2.finish_capture == 1 and not prev_finish_capture:
+                            print("[下位机] fin=1 上升沿但当前未在等待，"
+                                  "已同步电平（本次不触发完成）")
                         prev_finish_capture = 1 if chassis_data2.finish_capture else 0
 
                 # 下位机已到达指定区域（抓取区/放置区）
@@ -1434,6 +1462,7 @@ def main():
                     target_index = 0
                     if phase == PLACE_ACTION:
                         place_waiting_arrived = False
+                        place_prealign_active = PLACE_PREALIGN_ENABLED
                         placed_digits = set()
                         placed_order = []
                         last_placed_digit = None
@@ -1443,7 +1472,13 @@ def main():
                         }
                         if placement_recognizer is None:
                             placement_recognizer = PlacementRecognizer()
-                        print("已到达放置区，开始识别物料（圆环数字）")
+                        print(
+                            "已到达放置区，开始识别物料（圆环数字）"
+                            + (
+                                "；先拿最近可见圆环调整车的位置"
+                                if place_prealign_active else ""
+                            )
+                        )
                     else:
                         grabbed_slots = set()
                         last_grabbed_slot = None
@@ -1468,12 +1503,28 @@ def main():
                         release_action = GRAB_ACTION
                         release_number = 0
                     else:
-                        release_target = (
-                            slot_of_place_digit.get(last_placed_digit, 0)
-                            if last_placed_digit is not None else 0
+                        # 放置完成后补发的 capture=0 里带“下一个应放数字”，
+                        # 让下位机知道要移动到下一个圆环（例如放完 1 → number=3）。
+                        remaining_digits = [
+                            int(d) for d in rounds[current_round]["place"]
+                            if int(d) not in placed_digits
+                            and int(d) != last_placed_digit
+                        ]
+                        next_place_digit = (
+                            remaining_digits[0] if remaining_digits else None
                         )
+                        if next_place_digit is not None:
+                            release_target = slot_of_place_digit.get(
+                                next_place_digit, 0
+                            )
+                            release_number = next_place_digit
+                        else:
+                            release_target = (
+                                slot_of_place_digit.get(last_placed_digit, 0)
+                                if last_placed_digit is not None else 0
+                            )
+                            release_number = last_placed_digit or 0
                         release_action = PLACE_ACTION
-                        release_number = last_placed_digit or 0
                     enqueue_latest(q, VisionToGimbal(
                         target=release_target if release_target is not None else 0,
                         number=release_number,
@@ -1491,6 +1542,27 @@ def main():
                         last_grabbed_slot = None
                         reset_action_state()
                         if TRAY_PHASE_WAIT_ARRIVED:
+                            # actual 顺序下每抓完一个托盘，发下一个托盘的移动指令
+                            # （number=圆环数字, target=槽位），让下位机前往下一个
+                            # 托盘；并吞掉遗留 arrived=1，等新的 0→1 再抓。
+                            if tray_plan and not TRAY_PHASE_IS_REVERSE:
+                                _next_digit, _ = tray_plan[0]
+                                _next_slot = slot_of_place_digit.get(
+                                    _next_digit, _next_digit
+                                )
+                                # q.put 保证在“补发 capture=0”之后按序发送
+                                q.put(VisionToGimbal(
+                                    target=_next_slot,
+                                    number=_next_digit,
+                                    action=TRAY_PHASE_ACTION,
+                                    capture=False,
+                                ))
+                                print(
+                                    f"[托盘] 已发送前往下一托盘 {_next_digit} "
+                                    f"的移动指令 (target={_next_slot}, "
+                                    f"number={_next_digit})"
+                                )
+                                prev_arrived = 1
                             print("托盘抓取完成，已补发 capture=0，"
                                   "等待下位机前往下一托盘（arrived=1）")
                         else:
@@ -1561,13 +1633,29 @@ def main():
                                 tray_order_label = (
                                     "倒序"
                                     if TRAY_PHASE_IS_REVERSE
-                                    else "实际顺序"
+                                    else "实际顺序（第一组抓取顺序）"
                                 )
-                                tray_targets = (
-                                    list(reversed(placed_order))
-                                    if TRAY_PHASE_IS_REVERSE
-                                    else list(placed_order)
-                                )
+                                # actual = 按第一组物块抓取顺序（颜色顺序）对应的
+                                # 放置圆环数字；reverse = 该顺序的倒序。
+                                # 例如抓取颜色 [3,4,5]、放置序列 [1,3,2] 时，
+                                # actual 托盘顺序 = [1,3,2]。
+                                _grab_colors = list(rounds[current_round]["grab"])
+                                _place_digits = list(rounds[current_round]["place"])
+                                _grab_slot_of_color = {
+                                    c: i + 1 for i, c in enumerate(_grab_colors)
+                                }
+                                tray_targets = []
+                                for _color in _grab_colors:
+                                    _g_slot = _grab_slot_of_color.get(_color)
+                                    if (
+                                        _g_slot is not None
+                                        and 1 <= _g_slot <= len(_place_digits)
+                                    ):
+                                        tray_targets.append(
+                                            int(_place_digits[_g_slot - 1])
+                                        )
+                                if TRAY_PHASE_IS_REVERSE:
+                                    tray_targets.reverse()
                                 # 进入阶段时一次算好每个托盘对应的物块颜色，
                                 # 避免后面 slot_of_color 被单托盘映射覆盖后找不到颜色
                                 tray_plan = []
@@ -1576,7 +1664,7 @@ def main():
                                     _tray_color = None
                                     if _place_slot is not None:
                                         _tray_color = next(
-                                            (c for c, s in slot_of_color.items()
+                                            (c for c, s in _grab_slot_of_color.items()
                                              if s == _place_slot),
                                             None,
                                         )
@@ -1603,16 +1691,53 @@ def main():
                                 log_tray_order(
                                     current_round + 1,
                                     round_cycles_done + 1,
-                                    placed_order,
-                                    TRAY_PHASE_ORDER,
+                                    tray_targets,
+                                    tray_order_label,
                                 )
                                 # 进入托盘阶段：
-                                # edge 模式下第一个托盘就是刚放置的位置，
-                                # 下位机 finish 后 arrived 会直接置 1；
-                                # 这里把 prev_arrived 置 0，让这个 arrived=1
-                                # 作为第一个托盘的到达上升沿被正确消费。
-                                # none 模式不依赖 arrived，此值不影响。
+                                # 倒序时第一个托盘就是刚放置的位置，放置完成后的
+                                # arrived=1 可直接作为第一个托盘的到达信号。
+                                # actual 顺序下第一个托盘不是当前位置：
+                                # 先发移动指令（number=圆环数字, target=槽位）
+                                # 让下位机前往第一个托盘，并吞掉遗留 arrived=1，
+                                # 等它到达后新的 0→1 再开始抓取。
                                 prev_arrived = 0
+                                if (
+                                    tray_plan
+                                    and TRAY_PHASE_WAIT_ARRIVED
+                                    and not TRAY_PHASE_IS_REVERSE
+                                ):
+                                    _first_digit, _ = tray_plan[0]
+                                    _first_slot = slot_of_place_digit.get(
+                                        _first_digit, _first_digit
+                                    )
+                                    tray_move_delay_vg = VisionToGimbal(
+                                        target=_first_slot,
+                                        number=_first_digit,
+                                        action=TRAY_PHASE_ACTION,
+                                        capture=False,
+                                    )
+                                    if TRAY_PHASE_ENTRY_DELAY_S > 0:
+                                        tray_move_delay_until = (
+                                            time.time() + TRAY_PHASE_ENTRY_DELAY_S
+                                        )
+                                        print(
+                                            f"[托盘] 放置完成，延时 "
+                                            f"{TRAY_PHASE_ENTRY_DELAY_S:.1f}s 后发送"
+                                            f"前往第一个托盘 {_first_digit} 的移动指令"
+                                            f" (target={_first_slot}, "
+                                            f"number={_first_digit})"
+                                        )
+                                    else:
+                                        # 用 q.put 保证在“补发 capture=0”之后按序发送
+                                        q.put(tray_move_delay_vg)
+                                        tray_move_delay_vg = None
+                                        print(
+                                            f"[托盘] 已发送前往第一个托盘 {_first_digit} "
+                                            f"的移动指令 (target={_first_slot}, "
+                                            f"number={_first_digit})"
+                                        )
+                                    prev_arrived = 1
                                 reset_action_state()
                                 tray_pending_digit = None
                                 arrival_wait_txt = (
@@ -1654,6 +1779,35 @@ def main():
                 # 复用抓取阶段的视觉跟踪逻辑：按托盘对应物块颜色识别、
                 # 动态调夹爪，位置稳定且对准后才发 capture=1。
                 if tray_phase_active:
+                    # 进入托盘阶段的延时等待：放置完最后一个物块后不立即发
+                    # “前往第一个托盘”的移动指令，等延时结束再发送。
+                    # 延时期间持续吞掉当前 arrived=1，避免被误当成“已到达托盘”。
+                    if tray_move_delay_until is not None:
+                        if time.time() < tray_move_delay_until:
+                            prev_arrived = 1
+                            if frame is not None:
+                                cv2.putText(
+                                    frame,
+                                    f"Tray phase: sending move in "
+                                    f"{tray_move_delay_until - time.time():.1f}s",
+                                    (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                    (0, 255, 255), 2,
+                                )
+                                show_detection(frame)
+                            if cv2.waitKey(1) & 0xFF == ord('q'):
+                                break
+                            continue
+                        if tray_move_delay_vg is not None:
+                            q.put(tray_move_delay_vg)
+                            print(
+                                f"[托盘] 延时结束，已发送前往第一个托盘 "
+                                f"{tray_move_delay_vg.number_} 的移动指令"
+                                f" (target={tray_move_delay_vg.target_}, "
+                                f"number={tray_move_delay_vg.number_})"
+                            )
+                        tray_move_delay_vg = None
+                        tray_move_delay_until = None
+                        prev_arrived = 1
                     if arrived_rising:
                         if tray_pending_digit is not None:
                             # 上一托盘还没抓完：这个 arrived 上升沿只是干扰，
@@ -1694,6 +1848,8 @@ def main():
                         tray_plan = []
                         tray_pending_digit = None
                         tray_pending_slot = None
+                        tray_move_delay_until = None
+                        tray_move_delay_vg = None
                         print("托盘阶段完成，前往下一个放置区/下一轮")
                         # 临时绕过：这个 arrived 0→1 直接当作“已到达下一个放置区”，
                         # advance 不再重发 action=2、不再等新的上升沿。
@@ -1745,6 +1901,8 @@ def main():
                             tray_plan = []
                             tray_pending_digit = None
                             tray_pending_slot = None
+                            tray_move_delay_until = None
+                            tray_move_delay_vg = None
                             prev_arrived = 1
                             print("托盘阶段完成，前往下一个放置区/下一轮")
                             result = advance_after_placement_cycle()
@@ -1849,6 +2007,10 @@ def main():
                                 continue
                             place_waiting_arrived = False
                             print("已到达下一个放置位置，继续识别")
+                            # 重置底盘指令平滑/发送状态，避免沿用上一个槽位的
+                            # 旧目标（last_smooth_cmd_mm），防止恢复跟踪时车被
+                            # 斜坡指令从旧位置冲到新位置（表现为突然向前冲）。
+                            reset_action_state()
 
                         # 下位机 arrived=1 时才允许识别/放置，否则不识别
                         # （下位机移动中 arrived=0，自然停在这里等它到位）
@@ -1909,12 +2071,42 @@ def main():
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                         (0, 255, 0), 1)
 
-                        candidates = [
+                        # 放置顺序按二维码放置序列执行（如 132）：
+                        # 到达放置区后先进入预对准，拿最近可见圆环（如数字 2）
+                        # 调车，只发 capture=0、不发 capture=1；对准完成后，
+                        # 若它不是应放数字，就发应放数字（如 1）让下位机前往
+                        # 对应圆环放置；若它就是应放数字，则直接进入放置。
+                        # 预对准结束后只认当前应放数字，避免 number/target 为 0。
+                        next_place_digit = next(
+                            (int(d) for d in rounds[current_round]["place"]
+                             if int(d) not in placed_digits),
+                            None,
+                        )
+                        placed_set = set(placed_digits)
+                        preferred = [
                             r for r in all_rings
                             if r["digit"] is not None
-                            and r["digit"] not in placed_digits
+                            and r["digit"] not in placed_set
+                            and r["digit"] in slot_of_place_digit
+                            and (next_place_digit is None
+                                 or r["digit"] == next_place_digit)
+                        ]
+                        fallback = [
+                            r for r in all_rings
+                            if r["digit"] is not None
+                            and r["digit"] not in placed_set
                             and r["digit"] in slot_of_place_digit
                         ]
+                        if place_prealign_active and fallback:
+                            # 预对准：先拿最近可见圆环（如数字 2）调车，不放置；
+                            # 若最近可见的正好是应放数字，对准后直接进入放置
+                            candidates = fallback
+                        elif place_prealign_active:
+                            candidates = []
+                        else:
+                            # 预对准结束后只认当前应放数字，不越序放置
+                            candidates = preferred
+                        using_prealign = place_prealign_active and bool(candidates)
 
                         if not candidates:
                             now = time.time()
@@ -1925,7 +2117,8 @@ def main():
                                      if r["digit"] is not None}
                                 )
                                 print(
-                                    f"[放置] 识别到数字 {digits_seen}，"
+                                    f"[放置] 下一个应放数字={next_place_digit}，"
+                                    f"识别到数字 {digits_seen}，"
                                     f"槽位映射={slot_of_place_digit}，"
                                     f"已放={sorted(placed_digits)}，无候选，未发送"
                                 )
@@ -1937,10 +2130,26 @@ def main():
                                 break
                             continue
 
-                        # 多个圆环同时可见时，优先选择离图像中心最近（当前下位机所在位置）的圆环；
-                        # 若上一帧已锁定同一数字的圆环，则优先沿用其圆心附近的候选，
+                        if using_prealign and time.time() - last_place_dbg >= 1.0:
+                            last_place_dbg = time.time()
+                            digits_seen = sorted(
+                                {r["digit"] for r in candidates
+                                 if r["digit"] is not None}
+                            )
+                            print(
+                                f"[放置] 当前应放数字={next_place_digit} 不可见，"
+                                f"先用可见圆环 {digits_seen} 调整车的位置（暂不放置）"
+                            )
+
+                        # 候选优先是“当前应放数字”；多个同名圆环（异常情况）
+                        # 取离图像中心最近的一个；若上一帧已锁定同一数字的圆环，
+                        # 则优先沿用其圆心附近的候选，
                         # 避免识别在相邻圆环/边缘残缺圆环之间来回切换（圆心跳边）。
-                        if place_last_center is not None and place_last_digit == digit:
+                        if (
+                            place_last_center is not None
+                            and place_last_digit is not None
+                            and any(r["digit"] == place_last_digit for r in candidates)
+                        ):
                             target = min(
                                 candidates,
                                 key=lambda r: (
@@ -1959,6 +2168,13 @@ def main():
                         digit = target["digit"]
                         slot_index = slot_of_place_digit[digit]
                         ring_cx, ring_cy = target["center"]
+                        if using_prealign:
+                            cv2.putText(
+                                frame,
+                                f"PREALIGN digit {digit} (no capture)",
+                                (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (0, 255, 255), 2,
+                            )
                         # 对圆心做轻量 EMA 平滑：识别偶发跳边只被衰减，
                         # 不会像“丢弃帧”那样把车辆完全卡住；切换数字时重新初始化。
                         if place_smooth_center is None or place_last_digit != digit:
@@ -2004,11 +2220,18 @@ def main():
 
                         cur_offset = abs(ring_cx - w_img // 2)
                         cur_y_offset = abs(ring_cy - h_img // 2)
-                        capture = (
+                        aligned = (
                             position_stable
                             and cur_offset <= PLACE_CENTER_TOLERANCE_PX
                             and cur_y_offset <= PLACE_CENTER_TOLERANCE_Y_PX
                         )
+                        if using_prealign:
+                            # 预对准阶段只调车，不执行放置动作
+                            capture = False
+                            prealign_finished = aligned
+                        else:
+                            capture = aligned
+                            prealign_finished = False
                         cv2.putText(
                             frame,
                             f"place stable: {place_stable_count}/{place_stable_threshold}",
@@ -2126,6 +2349,37 @@ def main():
                                     f"距上次发送={now - last_tracking_send:.2f}s "
                                     f"x偏移={cur_offset}px"
                                 )
+
+                        if prealign_finished:
+                            if digit == next_place_digit:
+                                # 预对准用的正好是当前应放数字：不移动，直接开始放置
+                                print(
+                                    f"[放置] 已用圆环数字 {digit} 完成预对准，"
+                                    "当前即应放数字，开始放置"
+                                )
+                                place_prealign_active = False
+                                reset_action_state()
+                                continue
+                            if next_place_digit is not None:
+                                # 预对准完成：不再用数字 2 继续调车，发当前应放数字
+                                # （如 1），让下位机前往对应圆环后由视觉继续对准放置。
+                                next_slot = slot_of_place_digit.get(next_place_digit, 0)
+                                print(
+                                    f"[放置] 已用圆环数字 {digit} 调整完车的位置，"
+                                    f"发送应放数字 {next_place_digit} "
+                                    f"(target={next_slot})，等待下位机到达指定圆环"
+                                )
+                                enqueue_latest(q, VisionToGimbal(
+                                    target=next_slot,
+                                    number=next_place_digit,
+                                    action=PLACE_ACTION,
+                                    capture=False,
+                                ))
+                                place_prealign_active = False
+                                place_waiting_arrived = True
+                                reset_action_state()
+                                continue
+                            place_prealign_active = False
 
                         if capture and last_placed_digit is None:
                             last_placed_digit = digit
@@ -2823,8 +3077,16 @@ def main():
                                 send_x_mm = int(round(chassis_x))
                                 send_y_mm = int(round(chassis_y))
 
+                            # 托盘阶段复用抓取逻辑，但 number 保持当前托盘号
+                            # （如 1），避免后续跟踪/抓取包把 num 置 0。
+                            track_number = (
+                                tray_pending_digit
+                                if tray_phase_active and tray_pending_digit is not None
+                                else 0
+                            )
                             vg = VisionToGimbal(
                                 target=slot_index,
+                                number=track_number,
                                 action=GRAB_ACTION,
                                 capture=capture,
                                 chassis_x_mm=send_x_mm,
@@ -2837,7 +3099,7 @@ def main():
                             ):
                                 enqueue_latest(q, vg)
                                 log_command(
-                                    "抓取", slot_index, 0, GRAB_ACTION, capture,
+                                    "抓取", slot_index, track_number, GRAB_ACTION, capture,
                                     send_x_mm, send_y_mm, gripper_mm,
                                     chassis_x, chassis_y, chassis_vx, chassis_vy,
                                     fb_gripper_mm=fb_gripper_mm,

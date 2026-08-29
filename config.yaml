@@ -130,9 +130,9 @@ colors:
 #   只在该区域内找物块，可排除场地边缘/自身部件误检；null = 全图。
 detection:
   detection_area:
-  - 160
+  - 140
   - 170
-  - 340
+  - 230
   - 190
   # 颜色掩膜形态学核大小（px）
   kernel_size: 3
@@ -149,9 +149,9 @@ detection:
     min_area_factor: 0.2
   stability:
     # 抓取前的稳定条件（两条件独立计数、都满足才算稳定）：
-    threshold: 15
+    threshold: 20
     #   位置：连续 threshold 帧，且相邻帧圆心位移 < max_pixel_move(px)
-    max_pixel_move: 10
+    max_pixel_move: 7
     #   颜色：连续 color_stable_threshold 帧识别为同一颜色
     color_stable_threshold: 5
   # 物块消失超过该毫秒数后丢弃上一帧结果
@@ -220,17 +220,22 @@ placement:
   place_stable_max_pixel_move: 6
   # 圆心 EMA 平滑系数（0~1）：越大越跟手，越小越抗识别抖动。
   # 识别偶发跳边时只被衰减，不会像“丢弃帧”那样把车辆完全卡住
-  place_center_smooth_alpha: 0.3
+  place_center_smooth_alpha: 0.34
   # 视觉误差增益（0~1）：目标位置 = 回传位置 + 视觉误差 × 增益。
   # 降增益让底盘只响应持续存在的偏差，避免单帧识别噪声被全量放大
-  place_visual_gain: 0.5
+  place_visual_gain: 0.7
   # 放置阶段底盘指令变化死区（mm）：比 tracking.chassis_send_deadband_mm 大，
   # 过滤小幅识别抖动，只有偏差累积到超过该值才重新发指令
-  place_chassis_deadband_mm: 5
+  place_chassis_deadband_mm: 1.5
+  # true=到达放置区后先拿最近可见圆环（如数字 2）调整车的位置
+  # （只发跟踪不发 capture=1）；调整完成后，若它不是应放数字，
+  # 再发应放数字让下位机前往对应圆环放置
+  place_prealign_enabled: true
   # true=放置完成后进入托盘阶段（把物块夹回后部槽位）
   tray_phase_enabled: true
-  # 托盘抓取顺序：reverse=按实际放置顺序倒序；actual=按实际放置顺序
-  tray_phase_order: reverse
+  # 托盘抓取顺序：actual=按实际放置顺序（放置顺序固定为二维码放置序列，
+  # 因此等价于按抓取颜色顺序，如 345）；reverse=按实际放置顺序倒序
+  tray_phase_order: actual
   # 托盘阶段动作码（保留兼容，默认 1=抓取）
   tray_phase_action: 1
   # true=每轮最后一次放置（放置区 B）不夹起，直接进下一轮
@@ -238,6 +243,9 @@ placement:
   # 托盘阶段 arrived 处理：edge=逐托盘等 0→1 上升沿；
   # none=不等待 arrived，进入即抓、抓完立即下一个（无上升沿时用）
   tray_phase_arrived_mode: edge
+  # 放置完最后一个物块、收到 finish_capture=1 后，延时该秒数再发送
+  # “前往第一个托盘”的移动指令（number=托盘号）；0=不延时
+  tray_phase_entry_delay_s: 2.0
   # 倒序托盘阶段夹爪策略：dynamic=动态、min/max=固定最短/最长、
   # 数字=固定伸长 mm；actual 顺序时复用 tracking.grab_gripper_fixed
   tray_gripper_fixed: 40
@@ -354,7 +362,7 @@ kalman_world:
 # ==================== 底盘换算（src.py 拦截规划用） ====================
 chassis:
   # 下位机 mm / mm/s → 图像 px / px/s 的倍率（calibrate_px_per_mm.py 标定）
-  px_per_mm: 0.165
+  px_per_mm: 0.15
 
 # ==================== 主控制开关（src.py → control） ====================
 control:
@@ -372,8 +380,8 @@ control:
   # 判定窗口（帧）：开始识别后的前 N 帧内检测到第一目标颜色即判定“已在场”
   grab_skip_first_eval_frames: 5
   # 放置阶段 x/y 对准容差（px）
-  place_center_tolerance_px: 8
-  place_center_tolerance_y_px: 8
+  place_center_tolerance_px: 7
+  place_center_tolerance_y_px: 7
 
 # ==================== 串口发送/跟踪（src.py → tracking） ====================
 tracking:
@@ -382,12 +390,12 @@ tracking:
   # 普通跟踪包（capture=0）最小发送间隔（秒）
   send_interval: 0.02
   # 底盘/夹爪指令相对上次发送变化小于该值（mm）则不重发（死区）
-  chassis_send_deadband_mm: 2
-  gripper_deadband_mm: 2
+  chassis_send_deadband_mm: 1.5
+  gripper_deadband_mm: 1.5
   # 抓取阶段固定夹爪伸长量（mm），None/0=动态调节
   grab_gripper_fixed: 40
   # 固定夹爪模式：等待夹爪反馈到位（误差 ≤ 该值 mm）才允许底盘跟踪
-  grab_gripper_settle_tolerance_mm: 3
+  grab_gripper_settle_tolerance_mm: 2
   # 夹爪到位等待超时（秒），超时不再等
   grab_gripper_settle_timeout_s: 5.0
   # 底盘指令斜率限幅：每个发送周期目标最多变化该值（mm），防起步/减速猛冲

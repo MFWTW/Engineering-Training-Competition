@@ -43,7 +43,7 @@ except ImportError:  # 非 Linux 环境（如 Windows）跳过单实例锁
 
 DEFAULT_STATE_FILE = "/tmp/qr_display_result.txt"
 LOCK_FILE = "/tmp/qr_display.lock"
-WAIT_TEXT = "等待扫码..."
+WAIT_TEXT = ""
 
 _lock_fd = None
 

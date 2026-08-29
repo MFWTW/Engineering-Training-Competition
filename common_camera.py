@@ -13,8 +13,8 @@ CAMERA_ROLES_FILE = os.path.join(BASE_DIR, "camera_roles.json")
 # ==================== 两台 USB 免驱摄像头配置 ====================
 # 这里统一配置摄像头来源：可以填 OpenCV 设备编号（0、1），
 # 也可以填 /dev/video* 路径或 udev 符号链接（如 /dev/video_qr、/dev/video_detect）。
-QR_CAMERA_SOURCE = 1          # 二维码扫描相机（默认值，可被 camera_roles.json 覆盖）
-DETECTION_CAMERA_SOURCE = 0   # 物块检测/放置识别相机（默认值，可被 camera_roles.json 覆盖）
+QR_CAMERA_SOURCE = 0          # 二维码扫描相机（默认值，可被 camera_roles.json 覆盖）
+DETECTION_CAMERA_SOURCE = 1   # 物块检测/放置识别相机（默认值，可被 camera_roles.json 覆盖）
 
 # 物块检测相机默认分辨率（USB 相机不支持时会自动使用其默认分辨率）。
 # 如果换用支持更高分辨率的相机，请同时用同一分辨率重新标定相机内参。

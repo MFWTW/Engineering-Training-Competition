@@ -67,7 +67,8 @@
 - 第 4 组：第 2 轮放置编号 `231`。
 
 每轮抓取 **1 次**（物块进入机器人后部 3 个槽位），然后到放置区 A 全部放到圆环，
-托盘阶段倒序夹回后部槽位，再带到放置区 B 全部放置，最后回抓取区抓下一轮：
+托盘阶段按抓取颜色顺序（如 345）夹回后部槽位，再带到放置区 B 全部放置，
+最后回抓取区抓下一轮：
 
 ```
 第 1 轮：156 抓取 → 放置区A(123) → 托盘夹回 → 放置区B(123) → 回抓取区
@@ -122,18 +123,27 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
    - 最新数据包 `arrived != 1` 时整帧不识别，画面显示 “Waiting for arrived=1 ...”。
 3. 圆环识别：同心圆轮廓分组取最内层，中心裁剪 ROI 后用 MNIST 识别数字；
    数字必须是 1~3 且置信度 ≥ `min_digit_confidence`（0.8），
-   且不在 `placed_digits` 中、必须在本轮 `slot_of_place_digit` 映射内；
+   且优先等于**二维码放置序列中当前应放的那个数字**（如 `132` 先放 1、
+   再放 3、最后放 2），也必须在本轮 `slot_of_place_digit` 映射内；
+   到达放置区后会先拿最近可见圆环做**预对准**（例如下位机刚到位时只看到
+   数字 2，而应放顺序是 `1,3,2`）：只发 `capture=0` 跟踪包
+   （`target`/`number` 为该圆环对应的槽位/数字），不发 `capture=1`；
+   车对准稳定后，若该圆环正好是当前应放数字则直接放置，否则再发送当前应放
+   数字（如 `number=1`），让下位机前往对应圆环放置；每个槽位放完后补发的
+   `capture=0` 包会带**下一个应放数字**，让下位机继续移动到下一个圆环；
    - **遮挡反推**（`placement.occluded_digit_by_color=true` 时）：当圆环数字
      被上一轮留在放置区的物块挡住（如第 2 轮放置区 B），MNIST 识别不可靠时，
      改为识别圆环中心物块颜色，再按上一轮“槽位一致”关系反推出圆环数字
-     （颜色 → 上一轮槽位 → 上一轮圆环数字），之后仍按该数字对应的槽位
+      （颜色 → 上一轮槽位 → 上一轮圆环数字），之后仍按该数字对应的槽位
      取本轮物块放置；
-4. 多个候选取离图像中心最近的一个；**位置连续稳定 N 帧**
+4. 当前应放数字可见时不再按画面里最近的圆环先放；确认后
+   **位置连续稳定 N 帧**
    （`placement.place_stable_threshold`，默认 30 帧，相邻帧圆心位移
    `< placement.place_stable_max_pixel_move`，默认 20px）
    且 x 偏移 ≤ 5px 时发送 `capture=1`，记录 `last_placed_digit`，进入等待；
 5. 收到 `finish_capture=1`（0→1 上升沿）：
-   - 立即补发 `capture=0` 包；
+   - 立即补发 `capture=0` 包（放置阶段包里 `number` 为**下一个应放数字**，
+     让下位机移动到下一圆环；没有下一个时保持已放数字）；
    - 数字加入 `placed_digits`；
    - 没放满三个 → `place_waiting_arrived=true`，等下一个 `arrived=1` 再识别下一个圆环；
    - 放满三个 → 进入托盘阶段或轮次重复逻辑。
@@ -142,19 +152,23 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
 
 1. 放置完一轮 3 个后，若这不是本轮最后一次放置（`tray_phase_skip_last_of_round=true` 时），
    上位机进入托盘阶段：托盘队列按 `placement.tray_phase_order` 生成，
-   `reverse`=倒序（默认），例如实际顺序 `2,1,3` → `[3,1,2]`；
-   `actual`=按实际放置顺序，例如 `2,1,3` → `[2,1,3]`；
+   `actual`=按实际放置顺序（默认；放置顺序已固定为二维码放置序列，
+   所以等价于按抓取颜色顺序，如 `132` → `[1,3,2]` → 颜色 `345`）；
+   `reverse`=按实际放置顺序倒序，例如 `[1,3,2]` → `[2,3,1]`；
+   收到最后一个 `finish_capture=1` 后按 `placement.tray_phase_entry_delay_s`
+   （默认 2s）延时再发送第一条“前往第一个托盘”的移动指令（`number`=托盘号），
+   给下位机留出动作完成/稳定时间；
    进入托盘阶段后，`tray_phase_arrived_mode=edge`（默认）时第一个托盘使用
    放置完成后的 `arrived=1` 作为到达信号（第一个托盘即刚放置的位置时无需再等移动）；
    `none` 时完全不等待 `arrived`，进入托盘阶段立即抓第一个、抓完立即下一个。
 2. 每个托盘按“放置槽位映射”反推出该托盘上的物块颜色，然后复用抓取阶段的
    视觉跟踪逻辑：颜色稳定后跟踪（`capture=0`），位置连续稳定 N 帧且
    x 偏移 ≤ `grab_center_tolerance_px` 才发 `capture=1`；`target` 发送的是该托盘
-   物块要放回的放置槽位（即 `slot_of_place_digit[托盘号]`，例如实际顺序 `2,1,3`、
-   放置序列 `132` 时倒序抓取 `3,1,2`，对应 `target=2,1,3`）；
-   `tray_phase_order=reverse`（倒序）时夹爪按 `placement.tray_gripper_fixed` 原策略，
-   `actual` 时与第一次抓取一样（配置了 `tracking.grab_gripper_fixed` 则固定夹爪先到位、
+   物块要放回的放置槽位（即 `slot_of_place_digit[托盘号]`，例如放置序列 `132`、
+   抓取颜色 `345` 时按 `actual` 抓取 `1,3,2`，对应颜色 `3,4,5`、`target=1,3,2`）；
+   `tray_phase_order=actual` 时与第一次抓取一样（配置了 `tracking.grab_gripper_fixed` 则固定夹爪先到位、
    再只靠底盘对准；未配置则动态调整）；
+   `reverse`（倒序）时夹爪按 `placement.tray_gripper_fixed` 原策略；
 3. 每次收到 `finish_capture=1` 后补发 `capture=0`，等下一次 `arrived` 0→1
    再开始下一个托盘；
 4. 最后一个托盘抓完后，下位机再发 `arrived` 时不再夹起，
@@ -166,7 +180,7 @@ USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后�
 
 #### ⑥ 轮次重复与收尾
 
-- 放置区 A 放完（3 个）：先执行托盘阶段，把物块倒序夹回后部槽位，完成后
+- 放置区 A 放完（3 个）：先执行托盘阶段，把物块按抓取颜色顺序夹回后部槽位，完成后
   `round_cycles_done` 加 1，清空 `placed_digits`，发送 `action=2` 前往下一个放置区，
   等 `arrived=1` 后再次全部放置（不再回抓取区）；
 - 放置区 B（本轮最后一次）放完：**不执行托盘阶段**（不需要夹起），直接进入下一轮，
@@ -196,14 +210,14 @@ flowchart TD
     GRAB1 --> GO_PLACE["发 action=2，等 arrived=1"]
     GO_PLACE --> PLACE1["第1轮 放置区A：第2组数字"]
     GO_PLACE1 --> PLACE1
-    PLACE1 --> TRAY1["托盘阶段：倒序夹回后部槽位"]
+    PLACE1 --> TRAY1["托盘阶段：按颜色顺序夹回后部槽位"]
     TRAY1 --> GO_PLACE2["发 action=2 前往放置区B，等 arrived=1"]
     GO_PLACE2 --> PLACE2["第1轮 放置区B：第2组数字"]
     PLACE2 --> GO_GRAB2["发 action=1，等 arrived=1"]
     GO_GRAB2 --> GRAB2["第2轮第1次抓取：第3组颜色"]
     GRAB2 --> GO_PLACE3["发 action=2，等 arrived=1"]
     GO_PLACE3 --> PLACE3["第2轮 放置区A：第4组数字"]
-    PLACE3 --> TRAY2["托盘阶段：倒序夹回后部槽位"]
+    PLACE3 --> TRAY2["托盘阶段：按颜色顺序夹回后部槽位"]
     TRAY2 --> GO_PLACE4["发 action=2 前往放置区B，等 arrived=1"]
     GO_PLACE4 --> PLACE4["第2轮 放置区B：第4组数字"]
     PLACE4 --> DONE["全部完成，退出"]
@@ -377,15 +391,17 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `placement.occluded_color_override_digit` | `true` | `true`=颜色推断到数字时覆盖 MNIST 结果；`false`=仅在 MNIST 识别失败时用颜色推断 |
 | `placement.place_stable_threshold` | `30` | 放置阶段位置连续稳定帧数 |
 | `placement.place_stable_max_pixel_move` | `20` | 放置阶段相邻帧圆心最大位移（px） |
+| `placement.place_prealign_enabled` | `true` | 到达放置区后先拿最近可见圆环预对准（只发 `capture=0`），对准完成后再按应放顺序放置 |
 | `placement.record_placement_order` | `true` | `true` 时把每次实际放置的圆环数字按先后顺序追加写入 `placement_order.log`，并在每轮完成后追加“托盘阶段抓取顺序”（数字即托盘号） |
 | `placement.placement_order_log` | `./placement_order.log` | 放置顺序记录文件路径（追加写入，含时间戳） |
 | `placement.tray_phase_enabled` | `true` | `true` 时放置完成后进入托盘阶段（抓取托盘上的物块） |
-| `placement.tray_phase_order` | `reverse` | 托盘阶段抓取顺序：`reverse`=倒序（默认），`actual`=按实际放置顺序 |
+| `placement.tray_phase_order` | `actual` | 托盘阶段抓取顺序：`actual`=按实际放置顺序（默认；放置顺序固定为二维码放置序列，等价于按抓取颜色顺序），`reverse`=倒序 |
 | `placement.tray_phase_arrived_mode` | `edge` | 托盘阶段 arrived 处理：`edge`=逐托盘等 0→1 上升沿（默认，第一个托盘使用放置完成后的 `arrived=1`）；`none`=不等待 arrived，进入即抓、抓完立即下一个（下位机 arrived 持续为 1 时用） |
+| `placement.tray_phase_entry_delay_s` | `2.0` | 放置完最后一个物块、收到 `finish_capture=1` 后，延时该秒数再发送“前往第一个托盘”的移动指令；`0`=不延时 |
 | `placement.tray_phase_action` | `1` | 托盘阶段动作码（默认 1=抓取），保留兼容 |
 | `placement.tray_phase_capture` | `true` | 已由视觉跟踪取代：托盘阶段 capture 由位置稳定+对准决定 |
 | `placement.tray_phase_skip_last_of_round` | `true` | `true` 时每轮最后一次放置不需要夹起，直接进入下一轮 |
-| `placement.tray_gripper_fixed` | `30` | 倒序托盘阶段夹爪策略：`dynamic`=动态、`min`/`max`=固定最短/最长、数字=固定伸长 mm；`actual` 顺序时改为复用 `tracking.grab_gripper_fixed` |
+| `placement.tray_gripper_fixed` | `30` | `reverse` 倒序托盘阶段的夹爪策略：`dynamic`=动态、`min`/`max`=固定最短/最长、数字=固定伸长 mm；`actual` 顺序时改为复用 `tracking.grab_gripper_fixed` |
 
 #### gimbal.py —— 串口参数
 
@@ -419,7 +435,7 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 |---|---|---|---|
 | head | 2B | uint8×2 | `0x53 0x50` |
 | target | 1B | uint8 | 0=任务开始/区域移动, 1~3=物块槽位号 |
-| number | 1B | uint8 | 当前识别到的数字（放置阶段=圆环数字，其他阶段=0） |
+| number | 1B | uint8 | 当前识别到的数字（放置阶段=圆环数字；托盘阶段=当前托盘号；其他阶段=0） |
 | action | 1B | uint8 | 0=启动/空闲, 1=抓取, 2=放置 |
 | capture | 1B | uint8 | 0=跟踪/移动中, 1=执行动作（抓取或松爪放置） |
 | chassis_x | 2B | int16 | 底盘左右移动量（mm，正=左，负=右） |

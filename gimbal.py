@@ -19,7 +19,7 @@ class VisionToGimbal:
                  chassis_x_mm: int = 0, chassis_y_mm: int = 0, gripper_mm: int = 0):
         self.head: bytes = b"\x53\x50"
         self.target_: int = target          # uint8_t, 0~255
-        self.number_: int = int(number)     # uint8_t, 当前识别到的数字（放置阶段=圆环数字，其他=0）
+        self.number_: int = int(number)     # uint8_t, 数字（放置=圆环数字；托盘=托盘号；其他=0）
         self.action_: int = int(action)     # uint8_t, 0=启动/空闲, 1=抓取, 2=放置
         self.capture_: int = 1 if capture else 0  # uint8_t, 0=跟踪中/未抓取, 1=请求抓取
         self.chassis_x_mm: int = int(chassis_x_mm)  # int16_t，底盘左右移动量，正=左，负=右

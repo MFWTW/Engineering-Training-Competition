@@ -35,10 +35,7 @@ def scan_qrcode(thre_image, RAM_image):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     
     if barcodes and len(session) == 0:
-        cv2.imshow("QR Code Scanner", RAM_image)
         decode_data(data)
-    else:
-        cv2.imshow("QR Code Scanner", RAM_image)
 
 
 def decode_data(data):

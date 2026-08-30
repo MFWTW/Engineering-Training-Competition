@@ -145,6 +145,13 @@ CHASSIS_LOOKAHEAD_S = float(
 ) / 1000.0
 CHASSIS_LOOKAHEAD_S = max(0.0, min(CHASSIS_LOOKAHEAD_S, 0.5))
 
+# ==================== 串口生命周期（config.yaml → serial） ====================
+# 运行中串口连续断开超过该秒数后自动退出程序（systemd 重新拉起并等待，
+# 重新插上串口后自动从头开始运行）；0 = 一旦检测到断开立即退出。
+SERIAL_DISCONNECT_EXIT_DELAY_S = max(
+    0.0, float(_cfg("serial", "disconnect_exit_delay_s", default=3.0))
+)
+
 # ==================== 显示窗口（config.yaml → display） ====================
 # 宽度或高度超过时按同一比例缩小显示，避免画面超出屏幕；只影响显示，
 # 不影响检测分辨率与坐标换算
@@ -544,6 +551,21 @@ def show_detection(frame):
     cv2.imshow("detection", frame)
 
 
+def show_scan(frame):
+    """缩放后显示二维码扫描画面，防止窗口过大；仅显示用，不修改原始帧。"""
+    h, w = frame.shape[:2]
+    scale = min(
+        1.0,
+        DISPLAY_MAX_WIDTH / float(w),
+        DISPLAY_MAX_HEIGHT / float(h),
+    )
+    if scale < 1.0:
+        frame = cv2.resize(
+            frame, (int(round(w * scale)), int(round(h * scale)))
+        )
+    cv2.imshow("qr_scan", frame)
+
+
 _last_command_print = {"t": 0.0, "sig": None}
 _last_invalid_warn = {"t": 0.0}
 _last_zero_warn = {"t": 0.0}
@@ -685,14 +707,24 @@ def Sending2Gimbal(data_pack, serial_comm):
 
         if serial_comm:
             try:
-                serial_comm.send(vg)
+                sent_ok = serial_comm.send(vg)
+            except Exception as e:
+                print(f"  串口发送失败: {e}")
+                log_serial_tx(f"SEND-ERR {e}")
+                sent_ok = False
+            if sent_ok:
                 log_serial_tx(
                     f"t={vg.target_} n={vg.number_} a={vg.action_} c={vg.capture_} "
                     f"x={vg.chassis_x_mm} y={vg.chassis_y_mm} g={vg.gripper_mm}"
                 )
-            except Exception as e:
-                print(f"  串口发送失败: {e}")
-                log_serial_tx(f"SEND-ERR {e}")
+                if _tx_offline_logged:
+                    _tx_offline_logged = False
+                    print("[串口] 通信已恢复，继续发送")
+            else:
+                if not _tx_offline_logged:
+                    _tx_offline_logged = True
+                    log_serial_tx("OFFLINE")
+                    print("[串口离线] 发送失败，命令已丢弃，等待自动重连")
         else:
             if not _tx_offline_logged:
                 log_serial_tx("OFFLINE")
@@ -703,6 +735,15 @@ def Sending2Gimbal(data_pack, serial_comm):
 
 
 _QR_DISPLAY_PROC = None
+
+
+def _reset_qr_display_state():
+    """删除扫码结果状态文件，让仍在运行的外接屏回到空白状态。"""
+    state_file = os.environ.get("QR_DISPLAY_FILE", QR_DISPLAY_STATE_FILE)
+    try:
+        os.unlink(state_file)
+    except OSError:
+        pass
 
 
 def _read_log_tail(path, n=8):
@@ -719,7 +760,7 @@ def _read_log_tail(path, n=8):
 def _start_qr_display(reset_state=False):
     """自动拉起外接屏显示进程；已在运行时不重复启动。
 
-    reset_state=True 时清空状态文件，让外接屏先显示“等待扫码...”
+    reset_state=True 时清空状态文件，让外接屏先保持空白
     （只在 src.py 启动时调用；扫码命中时传 False，保留刚写入的结果）。
 
     显示进程用独立会话（setsid）+ 忽略 SIGHUP + 输出重定向到日志启动，
@@ -734,10 +775,7 @@ def _start_qr_display(reset_state=False):
     script = Path(__file__).resolve().parent / "qr_display.py"
     state_file = os.environ.get("QR_DISPLAY_FILE", "/tmp/qr_display_result.txt")
     if reset_state:
-        try:
-            os.unlink(state_file)
-        except OSError:
-            pass
+        _reset_qr_display_state()
     cmd = [sys.executable, str(script), "--file", state_file]
     if QR_DISPLAY_REPLACE:
         cmd.append("--replace")
@@ -755,6 +793,13 @@ def _start_qr_display(reset_state=False):
         log_fd = open(QR_DISPLAY_LOG_FILE, "a", encoding="utf-8")
     except OSError as exc:
         print(f"[QR显示] 无法打开显示进程日志 {QR_DISPLAY_LOG_FILE}: {exc}")
+        # 日志文件可能被旧进程/其它用户占用，退回用户自己的 /tmp 日志，
+        # 避免显示进程连日志都写不了。
+        try:
+            fallback = Path(f"/tmp/qr_display_{os.getuid()}.log")
+            log_fd = open(fallback, "a", encoding="utf-8")
+        except OSError as fallback_exc:
+            print(f"[QR显示] 备用日志 {fallback} 也无法打开: {fallback_exc}")
 
     try:
         _QR_DISPLAY_PROC = subprocess.Popen(
@@ -802,18 +847,42 @@ def main():
     global _serial_comm
 
     # ==================== 第一步：先识别并打开串口 ====================
-    # 只有串口识别并打开成功才继续运行主程序；失败直接退出，不进入主流程
+    # 串口未就绪时持续重试等待（不直接退出）；按 Ctrl+C 中止
     try:
         _serial_comm = SerialComm()
     except Exception as e:
         print(f"串口打开异常: {e}")
         _serial_comm = None
 
-    if _serial_comm is None or not _serial_comm.connected_:
-        print("未识别/打开串口失败，主程序不启动。")
-        print("请检查下位机串口连接（如 /dev/ttyACM0、/dev/ttyUSB0）后重新运行。")
-        _serial_comm = None
-        return
+    last_wait_msg = 0.0
+    while _serial_comm is None or not _serial_comm.connected_:
+        if _serial_comm is None:
+            try:
+                _serial_comm = SerialComm()
+            except Exception as e:
+                print(f"串口打开异常: {e}")
+                _serial_comm = None
+        else:
+            _serial_comm.retry_open(silent=True)
+
+        if _serial_comm is not None and _serial_comm.connected_:
+            break
+
+        now = time.time()
+        if now - last_wait_msg >= 5.0:
+            last_wait_msg = now
+            port_hint = _serial_comm.port if _serial_comm else "/dev/ttyACM0"
+            print(
+                "[串口] 尚未连接下位机串口，每 3 秒重试"
+                f"（当前目标 {port_hint}；请检查 USB/重新上电，Ctrl+C 退出）..."
+            )
+        try:
+            time.sleep(3.0)
+        except KeyboardInterrupt:
+            print("用户终止：未打开串口，退出")
+            if _serial_comm:
+                _serial_comm.close()
+            return
 
     print(f"串口识别并打开成功：{_serial_comm.port} @ {_serial_comm.baudrate}")
     _serial_comm.start_chassis_recv()
@@ -925,6 +994,7 @@ def main():
     place_prealign_active = False # 放置区“先用可见圆环调整车的位置”阶段是否激活
     last_worldkf_print = 0.0      # 世界系卡尔曼终端调试打印节流
     last_status_print = 0.0       # 底盘/夹爪状态行打印节流
+    serial_offline_since = None   # 串口连续断开起始时间（None=当前在线）
     target_colors = []          # 当前轮抓取颜色序列（rounds[current_round]["grab"] 的别名）
     target_index = 0
     last_detection_time = None
@@ -1278,10 +1348,33 @@ def main():
                 print("无法读取画面")
                 break
 
+            # ============ 串口断开检测：断开超过阈值即退出程序 ============
+            # 拔掉串口后进程正常退出，systemd 会自动重新拉起并等待；
+            # 重新插上串口后程序自动从头开始运行。
+            if _serial_comm is not None and not _serial_comm.connected_:
+                now = time.time()
+                if serial_offline_since is None:
+                    serial_offline_since = now
+                    print("[串口离线] 检测到串口断开，等待自动重连…")
+                elif (
+                    now - serial_offline_since
+                    >= SERIAL_DISCONNECT_EXIT_DELAY_S
+                ):
+                    print(
+                        f"[串口离线] 已连续断开 "
+                        f"{now - serial_offline_since:.1f}s，程序退出；"
+                        "重新插上串口后会自动启动"
+                    )
+                    break
+            else:
+                serial_offline_since = None
+
             # ============ QR 扫描阶段 ============
             if len(scan_QRcode_andlist.session) == 0:
                 Ostu_image = ostu_threshold(frame)
                 scan_QRcode_andlist.scan_qrcode(Ostu_image, frame)
+                # 显示扫码摄像头实时画面（识别到二维码时画面里会带绿色边框和文字）
+                show_scan(frame)
                 sessions = scan_QRcode_andlist.session
 
                 if sessions and sessions != last_sessions:
@@ -1377,7 +1470,11 @@ def main():
                     if cap:
                         cap.release()
                         cap = None
-                    cv2.destroyAllWindows()
+                    # 扫到二维码：关闭扫码画面窗口，切换到物块检测画面
+                    try:
+                        cv2.destroyWindow("qr_scan")
+                    except cv2.error:
+                        pass
                     print("识别到QR，关闭二维码USB摄像头")
                     detector.reset()
                     kf.reset()
@@ -3281,6 +3378,15 @@ class _LogTee:
 if __name__ == "__main__":
     import sys
     from datetime import datetime
+
+    # systemd 停止服务时默认发 SIGTERM；转成 KeyboardInterrupt，
+    # 让主程序的 finally 清理逻辑（释放资源）照常执行。
+    import signal
+
+    def _handle_sigterm(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     _log_file = None
     try:

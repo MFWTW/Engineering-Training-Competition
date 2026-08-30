@@ -16,7 +16,6 @@ _CLASS_COLOR = {
 def ostu_threshold(RAW_image):
     Gray_image = cv2.cvtColor(RAW_image, cv2.COLOR_BGR2GRAY)
     thre, Ostu_image = cv2.threshold(Gray_image, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    cv2.imshow("thre_image", Ostu_image)
     return Ostu_image
 
 #物块颜色处理

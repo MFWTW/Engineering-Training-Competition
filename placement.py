@@ -475,32 +475,6 @@ class PlacementRecognizer:
                         item["confidence"] = color_conf
             all_rings.append(item)
 
-        if SHOW_DEBUG:
-            # ---- 弹窗可视化处理过程 ----
-            if hasattr(self, "last_binary"):
-                cv2.imshow("placement_binary", self.last_binary)
-            if hasattr(self, "last_closed"):
-                cv2.imshow("placement_closed", self.last_closed)
-
-            vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            for ring in rings:
-                cx, cy = int(ring["center"][0]), int(ring["center"][1])
-                r = int(ring["radius"])
-                cv2.circle(vis, (cx, cy), r, (0, 255, 0), 2)
-                cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
-            cv2.imshow("placement_rings", vis)
-
-            if hasattr(self, "last_digit_crop"):
-                crop = self.last_digit_crop
-                cv2.imshow("placement_digit_crop",
-                           cv2.resize(crop, (280, 280),
-                                      interpolation=cv2.INTER_NEAREST))
-            if hasattr(self, "last_digit_canvas"):
-                canvas = self.last_digit_canvas
-                cv2.imshow("placement_digit_mnist",
-                           cv2.resize(canvas, (280, 280),
-                                      interpolation=cv2.INTER_NEAREST))
-
         if DEBUG and _debug_throttle(1.0):
             d = self.last_ring_debug
             digits_ok = [r for r in all_rings if r["digit"] is not None]

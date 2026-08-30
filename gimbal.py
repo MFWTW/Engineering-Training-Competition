@@ -19,8 +19,9 @@ def detect_serial_port(preferred: Optional[str] = None) -> Optional[str]:
     """自动识别可用串口设备。
 
     优先使用指定/默认端口；若该端口不存在，则从系统枚举的串口中
-    挑选第一个 USB 串口（/dev/ttyACM*、/dev/ttyUSB* 等）作为候选。
-    识别不到任何串口时返回 None，由调用方决定是否退出。
+    挑选第一个 USB 串口（/dev/ttyACM*、/dev/ttyUSB*，或带 VID/"usb"
+    描述的设备）作为候选。主板原生串口（/dev/ttyS*）不算可用串口，
+    不能乱开。识别不到可用串口时返回 None，由调用方决定是否退出。
     """
     ports = list_ports.comports()
 
@@ -29,23 +30,25 @@ def detect_serial_port(preferred: Optional[str] = None) -> Optional[str]:
         if any(p.device == preferred for p in ports) or os.path.exists(preferred):
             return preferred
 
-    # 2) 枚举到的串口里，优先 USB 串口类设备
-    def _score(port_info) -> int:
+    def _is_usb_like(port_info) -> bool:
         low = port_info.device.lower()
-        if low.startswith("/dev/ttyacm") or low.startswith("/dev/ttyusb"):
-            return 0
-        if port_info.vid is not None or (
-            port_info.description and "usb" in port_info.description.lower()
-        ):
-            return 1
-        return 2
+        return (
+            low.startswith("/dev/ttyacm")
+            or low.startswith("/dev/ttyusb")
+            or port_info.vid is not None
+            or (
+                port_info.description
+                and "usb" in port_info.description.lower()
+            )
+        )
 
-    if ports:
-        best = min(ports, key=_score)
-        return best.device
+    # 2) 只自动挑选“像 USB 串口”的设备；ttyS* 是主板原生串口，忽略
+    usb_like = [p for p in ports if _is_usb_like(p)]
+    if usb_like:
+        return min(usb_like, key=lambda p: p.device).device
 
-    # 3) 没枚举到任何串口，退回指定端口，让 open() 给出明确失败信息
-    return preferred
+    # 3) 没有 USB 串口时返回 None，保持默认端口，让 open() 给出明确失败信息
+    return None
 
 
 class VisionToGimbal:
@@ -161,6 +164,7 @@ class SerialComm:
         self.baudrate = baudrate
         self.max_retry = max_retry
         self.retry_delay = retry_delay
+        self.auto_detect = auto_detect
         self.ser: Optional[serial.Serial] = None
         self.packet: VisionToGimbal = VisionToGimbal()
         self.connected_ = False
@@ -184,17 +188,26 @@ class SerialComm:
         # self.ser: serial.Serial = serial.Serial(port, baudrate, timeout=0.5)
         # self.packet: VisionToGimbal = VisionToGimbal()
 
-    def open(self) -> bool:
-        """打开串口"""
+    def open(self, silent: bool = False) -> bool:
+        """打开串口；silent=True 时失败不打印错误（供启动等待循环使用）"""
         try:
             self.ser = serial.Serial(self.port, self.baudrate, timeout=0.5)
             self.connected_ = True
             logger.info(f"Serial {self.port} opened successfully.")
             return True
         except Exception as e:
-            logger.error(f"Failed to open serial {self.port}: {e}")
+            if not silent:
+                logger.error(f"Failed to open serial {self.port}: {e}")
             self.connected_ = False
             return False
+
+    def retry_open(self, silent: bool = False) -> bool:
+        """重新识别串口后重试打开（供启动阶段等待设备插入使用）。"""
+        if self.auto_detect:
+            detected = detect_serial_port(self.port)
+            if detected:
+                self.port = detected
+        return self.open(silent=silent)
         
     def close(self):
         """关闭串口"""
@@ -216,39 +229,59 @@ class SerialComm:
             except Exception as e:
                 logger.warning(f"Failed to clear buffers: {e}")
 
-    def reconnect(self):
+    def reconnect(self, attempts: Optional[int] = None) -> bool:
         """
-        自动尝试重连串口，最多 max_retry 次
-        失败会延迟 retry_delay 秒再尝试
-        成功后清空缓冲区，确保状态同步
+        自动尝试重连串口，最多 attempts 次（默认 max_retry）。
+
+        每次尝试前都会重新识别串口（设备可能重新枚举成 ttyACM1 等新节点），
+        并先释放坏掉的句柄——EIO 后旧 fd 已失效，不 close 会导致重开失败。
+        成功后清空缓冲区，确保状态同步。
         """
+        if attempts is None:
+            attempts = self.max_retry
+        attempts = max(1, attempts)
+
         with self._lock:
             self.connected_ = False
 
-            for i in range(self.max_retry):
+            # 释放坏句柄：先 close 并置空，否则内核认为端口仍被占用
+            if self.ser:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+
+            for i in range(1, attempts + 1):
                 if self.quit_:
-                    logger.warning("[Gimbal] quit_ flag set, aborting reconnect.")
-                    break
+                    logger.warning("[Gimbal] 已请求退出，中止重连")
+                    return False
 
-            logger.warning(f"[Gimbal] Reconnecting serial, attempt {i + 1}/{self.max_retry}...")
+                # 设备可能重新枚举成新节点（ttyACM0 -> ttyACM1），每次重新探测
+                if self.auto_detect:
+                    detected = detect_serial_port(self.port)
+                    if detected:
+                        self.port = detected
 
-            # 先尝试关闭
-            try:
-                self.close()
-                time.sleep(self.retry_delay)
-            except Exception:
-                pass
-            
-            # 尝试重新打开
-            try:
-                self.open()
-                self.connected_ = True
-                self.clear_buffer()
-                logger.info("[Gimbal] Reconnected serial successfully.")
-                return True
-            except Exception as e:
-                logger.warning(f"[Gimbal] Reconnect failed: {e}")
-                time.sleep(self.retry_delay)
+                try:
+                    if self.open():
+                        self.clear_buffer()
+                        logger.info(f"[Gimbal] 串口重连成功: {self.port}")
+                        return True
+                except Exception as e:
+                    logger.warning(f"[Gimbal] 重连异常({self.port}): {e}")
+
+                if i < attempts:
+                    self._sleep_interruptible(self.retry_delay)
+
+            logger.warning(f"[Gimbal] 串口重连 {attempts} 次失败，等待下次重试")
+            return False
+
+    def _sleep_interruptible(self, seconds: float):
+        """分段睡眠，quit_ 置位时能尽快退出。"""
+        deadline = time.time() + max(0.0, seconds)
+        while not self.quit_ and time.time() < deadline:
+            time.sleep(min(0.1, max(0.01, deadline - time.time())))
 
  
     def send(self, VG: Optional[VisionToGimbal] = None) -> bool:
@@ -257,8 +290,12 @@ class SerialComm:
             VG = self.packet
 
         if not self.connected_ or not self.ser or not self.ser.is_open:
+            # 接收线程在跑时由它统一负责后台重连，发送线程不重复抢开串口，
+            # 避免断线期间每次发送都刷一条重连日志。
+            if self._recv_thread is not None and self._recv_thread.is_alive():
+                return False
             logger.warning("[Gimbal] Serial not connected, attempting reconnect...")
-            if not self.reconnect():
+            if not self.reconnect(attempts=1):
                 return False
 
         try:
@@ -273,8 +310,10 @@ class SerialComm:
     def read(self, size: int = GimbalToVision.RECV_SIZE) -> bytes:
         """读取数据，如果断开则自动重连"""
         if not self.connected_ or not self.ser or not self.ser.is_open:
+            if self._recv_thread is not None and self._recv_thread.is_alive():
+                return b""
             logger.warning("[Gimbal] Serial not connected, attempting reconnect...")
-            if not self.reconnect():
+            if not self.reconnect(attempts=1):
                 return b""
 
         try:
@@ -311,7 +350,24 @@ class SerialComm:
     def _chassis_recv_loop(self):
         """接收线程主循环：按 17 字节帧解析底盘数据"""
         buf = b""
+        reconnect_backoff = 1.0
+        fail_streak = 0
         while not self.quit_:
+            # 串口不可用（打开失败/EIO/重连失败后）→ 递增间隔退避重连，避免刷屏
+            if not self.connected_ or not self.ser or not self.ser.is_open:
+                try:
+                    ok = self.reconnect(attempts=1)
+                except Exception as e:
+                    logger.warning(f"[Gimbal] 重连异常: {e}")
+                    ok = False
+                if ok:
+                    reconnect_backoff = 1.0
+                    buf = b""  # 重连后清空残留，避免错帧
+                    continue
+                self._sleep_interruptible(reconnect_backoff)
+                reconnect_backoff = min(reconnect_backoff * 2.0, 30.0)
+                continue
+
             try:
                 with self._lock:
                     if self.ser and self.ser.is_open and self.ser.in_waiting > 0:
@@ -333,9 +389,25 @@ class SerialComm:
                                 self._latest_chassis = chassis
                 else:
                     time.sleep(0.01)
+                fail_streak = 0  # 本轮读写正常，链路健康
             except Exception as e:
-                logger.warning(f"[Gimbal] recv loop error: {e}")
-                time.sleep(0.1)
+                fail_streak += 1
+                if fail_streak == 1:
+                    logger.warning(f"[Gimbal] 串口读取异常，准备自动重连: {e}")
+                with self._lock:
+                    self.connected_ = False
+                    if self.ser:
+                        try:
+                            self.ser.close()
+                        except Exception:
+                            pass
+                        self.ser = None
+                if fail_streak >= 2:
+                    # 连续失败（含“重连成功后立刻又报错”的情况）：
+                    # 内核/设备可能仍在错误态，退避后再试，避免每次循环刷一行
+                    self._sleep_interruptible(reconnect_backoff)
+                    reconnect_backoff = min(reconnect_backoff * 2.0, 30.0)
+                # fail_streak == 1 时不 sleep，立即尝试重连
 
     def __del__(self):
         """析构时关闭串口"""

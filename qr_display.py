@@ -12,11 +12,12 @@ qr_display.py —— 外接屏幕大字显示二维码扫码结果
     --monitor 1          指定显示器序号（0 起）；默认自动选外接屏
                          （HDMI/DP/VGA/DVI 优先，多屏时其次选第 2 个屏）
     --text 156+123       直接显示固定内容，不监视文件（调试用）
-    --font-scale 0.16    大字大小占屏幕高度的比例
+    --font-mm 12         数字字号（物理尺寸，默认 12mm）
     --replace            若已有旧显示实例，先请其退出再接管（默认不替换）
 
 工作方式：scan_QRcode_andlist.py 每次扫到二维码会把原始内容写入状态文件；
-本程序检测到文件变化后，在外接屏幕上用超大字体显示该内容。
+本程序检测到文件变化后，在外接屏幕上用固定 12mm 字号显示该内容；
+等待扫码时屏幕为纯黑空白，不显示任何提示文字。
 如果窗口没有出现在外接屏上，先指定 DISPLAY，例如：
     DISPLAY=:10 python3 qr_display.py --monitor 1
 
@@ -42,10 +43,27 @@ except ImportError:  # 非 Linux 环境（如 Windows）跳过单实例锁
     fcntl = None
 
 DEFAULT_STATE_FILE = "/tmp/qr_display_result.txt"
-LOCK_FILE = "/tmp/qr_display.lock"
-WAIT_TEXT = ""
+EMPTY_TEXT = ""
 
 _lock_fd = None
+
+
+def _default_lock_file():
+    """单实例锁文件：优先用户自己的运行时目录，避免被 /tmp 里 root 建的旧锁挡住。
+
+    顺序：环境变量 QR_DISPLAY_LOCK_FILE > $XDG_RUNTIME_DIR/qr_display.lock
+    （本机为 /run/user/1000）> /tmp/qr_display_<uid>.lock。
+    """
+    env = os.environ.get("QR_DISPLAY_LOCK_FILE")
+    if env:
+        return env
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        return str(Path(runtime_dir) / "qr_display.lock")
+    return f"/tmp/qr_display_{os.getuid()}.lock"
+
+
+LOCK_FILE = _default_lock_file()
 
 
 def _read_lock_pid():
@@ -149,15 +167,19 @@ def _parse_xrandr():
         r"^(\S+)\s+connected\s+(?:primary\s+)?(\d+)x(\d+)\+(\d+)\+(\d+)"
     )
     for line in proc.stdout.splitlines():
-        match = pattern.match(line.strip())
+        line = line.strip()
+        match = pattern.match(line)
         if match:
             name, width, height, x, y = match.groups()
+            size_mm = re.search(r"(\d+)mm\s*[xX]\s*(\d+)mm", line)
             monitors.append({
                 "name": name,
                 "w": int(width),
                 "h": int(height),
                 "x": int(x),
                 "y": int(y),
+                "w_mm": int(size_mm.group(1)) if size_mm else 0,
+                "h_mm": int(size_mm.group(2)) if size_mm else 0,
             })
     return monitors
 
@@ -176,14 +198,28 @@ def pick_monitor(monitors, index=None):
     return monitors[1]
 
 
-class QRDisplay:
-    """黑色全屏窗口，居中显示扫码结果大字。"""
+def _disable_dpms():
+    """关闭 X 屏保与 DPMS 自动断电，让外接屏一直保持点亮。"""
+    try:
+        subprocess.run(
+            ["xset", "s", "off", "-dpms"],
+            timeout=3,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[QR显示] 关闭屏幕休眠失败（不影响显示）: {exc}")
 
-    def __init__(self, text=WAIT_TEXT, monitor_index=None, font_scale=0.16):
-        self.font_scale = font_scale
+
+class QRDisplay:
+    """黑色全屏窗口，居中显示扫码结果（默认字号 12mm）。"""
+
+    def __init__(self, text=EMPTY_TEXT, monitor_index=None, font_mm=12.0):
+        self.font_mm = font_mm
         self.root = tk.Tk()
         self.root.title("QR Display")
         self.root.configure(bg="black")
+        _disable_dpms()
 
         monitors = _parse_xrandr()
         self.monitor = pick_monitor(monitors, monitor_index)
@@ -192,12 +228,18 @@ class QRDisplay:
             self.width = m["w"]
             self.height = m["h"]
             self.root.geometry(f"{m['w']}x{m['h']}+{m['x']}+{m['y']}")
-            print(f"[QR显示] 使用显示器: {m['name']} ({m['w']}x{m['h']}@{m['x']},{m['y']})")
+            size_desc = f", 物理 {m['w_mm']}x{m['h_mm']}mm" if m["w_mm"] else ""
+            print(
+                f"[QR显示] 使用显示器: {m['name']} "
+                f"({m['w']}x{m['h']}@{m['x']},{m['y']}{size_desc})"
+            )
+            self.px_per_mm = m["w"] / m["w_mm"] if m["w_mm"] else None
         else:
             self.width = self.root.winfo_screenwidth()
             self.height = self.root.winfo_screenheight()
             self.root.attributes("-fullscreen", True)
             print(f"[QR显示] 无法枚举显示器，使用默认全屏 ({self.width}x{self.height})")
+            self.px_per_mm = None
 
         # 无边框 + 置顶，作为专用显示窗口
         self.root.overrideredirect(True)
@@ -220,17 +262,22 @@ class QRDisplay:
         self.root.bind("<Key-Q>", lambda _e: self.root.destroy())
 
     def set_text(self, text):
-        """更新显示内容，字号按屏幕宽度自动缩小以放下完整内容。"""
-        text = (text or "").strip()
-        shown = text if text else WAIT_TEXT
+        """更新显示内容；无内容时显示空白，字号固定为物理毫米尺寸。"""
+        shown = (text or "").strip()
         self.label.configure(text=shown)
 
-        size = max(20, int(self.height * self.font_scale))
-        font = tkfont.Font(family="DejaVu Sans", size=size, weight="bold")
-        max_width = self.width * 0.92
-        while font.measure(shown) > max_width and size > 18:
-            size -= 2
-            font.configure(size=size)
+        if self.px_per_mm:
+            # 按显示器物理尺寸换算像素，保证实际显示的物理字号就是 font_mm 毫米
+            size_px = max(1, round(self.font_mm * self.px_per_mm))
+            font = tkfont.Font(
+                family="DejaVu Sans", size=-size_px, weight="bold"
+            )
+        else:
+            # 拿不到屏幕物理尺寸时退回磅值（1mm ≈ 2.8346pt）
+            size_pt = max(1, round(self.font_mm * 72 / 25.4))
+            font = tkfont.Font(
+                family="DejaVu Sans", size=size_pt, weight="bold"
+            )
         self.label.configure(font=font)
 
     def mainloop(self):
@@ -252,7 +299,7 @@ def _watch_file(app, path, poll_ms=200):
         except FileNotFoundError:
             if last_mtime is not None:
                 last_mtime = None
-                app.set_text(WAIT_TEXT)
+                app.set_text(EMPTY_TEXT)
         except OSError as exc:
             print(f"[QR显示] 读取状态文件失败: {exc}")
         app.root.after(poll_ms, tick)
@@ -285,10 +332,10 @@ def main(argv=None):
         help="直接显示固定内容，不监视文件（调试用）",
     )
     parser.add_argument(
-        "--font-scale",
+        "--font-mm",
         type=float,
-        default=0.16,
-        help="大字高度占屏幕比例（默认 %(default)s）",
+        default=100.0,
+        help="数字字号（物理尺寸，毫米；默认 %(default).1f mm）",
     )
     parser.add_argument(
         "--replace",
@@ -301,7 +348,7 @@ def main(argv=None):
         return 2
 
     try:
-        app = QRDisplay(args.text or WAIT_TEXT, args.monitor, args.font_scale)
+        app = QRDisplay(args.text or EMPTY_TEXT, args.monitor, args.font_mm)
     except tk.TclError as exc:
         print(f"[QR显示] 无法打开显示窗口: {exc}")
         print("请确认设置了正确的 DISPLAY，例如: DISPLAY=:10 python3 qr_display.py")
@@ -310,7 +357,10 @@ def main(argv=None):
 
     if args.text is None:
         print(f"[QR显示] 监视扫码结果文件: {args.file}")
-        print("[QR显示] 扫码后外接屏自动显示识别数字（按 Esc / Q 或 Ctrl+C 退出）")
+        print(
+            f"[QR显示] 等待扫码时显示空白；扫码后自动显示识别数字"
+            f"（字号 {args.font_mm:g}mm，按 Esc / Q 或 Ctrl+C 退出）"
+        )
         _watch_file(app, args.file)
     else:
         print(f"[QR显示] 固定显示: {args.text}")

@@ -1,0 +1,19 @@
+[Unit]
+Description=RoboMaster Engineer Main Program (src.py)
+# 图形会话就绪后再启动，保证 DISPLAY / XAUTHORITY 可用
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/xu/Engineer/autostart/run_robomaster.sh
+WorkingDirectory=/home/xu/Engineer
+# 串口/摄像头未就绪时，run_robomaster.sh 会等待；
+# 程序异常退出后 10 秒自动重试
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

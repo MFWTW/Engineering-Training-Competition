@@ -86,7 +86,9 @@
 
 USB 摄像头取帧 → Otsu 二值化 → `pyzbar` 解码，识别到一次后固定不再扫描；
 按 `+` 拆成 4 组，两两解析为 2 轮任务，每轮附 `repeat: 2`；
-关闭二维码摄像头，切换到物块检测 USB 摄像头。
+扫码期间 `qr_scan` 窗口实时显示摄像头画面（识别到二维码时带绿色边框和文字），
+识别成功后自动关闭该窗口、关闭二维码摄像头，并切换到物块检测画面
+（`detection` 窗口）。
 
 #### ② 首次区域移动
 
@@ -279,6 +281,7 @@ src.py 的可调参数已全部迁移到 [config.yaml](config.yaml) 对应分段
 | `tracking.chassis_lookahead_ms` | `150` | 前瞻时间：把物块未来 T ms 的位置作为底盘目标发给下位机，补偿延迟；`0` 关闭 |
 | `tracking.chassis_lookahead_max_speed_mm_s` | `50` | 前瞻目标速度上限（mm/s），防止异常速度把目标推太远 |
 | `tracking.send_heartbeat` | `5.0` | 普通跟踪包心跳间隔（秒），应大于 `tracking.send_interval`；`null` 禁用 |
+| `serial.disconnect_exit_delay_s` | `3.0` | 运行中串口连续断开超过该秒数即退出程序（systemd 重新拉起等待，重新插上串口后自动从头运行）；`0` = 断开立即退出 |
 | `display.max_width` / `max_height` | `800` / `540` | 显示窗口最大尺寸（px），宽或高超过时按同一比例缩小，仅影响显示 |
 | `display.serial_overlay.enabled` | `true` | 在画面左下角叠加显示串口收发信息（只用英文/数字，避免中文乱码） |
 | `display.serial_overlay.max_lines` | `4` | TX / RX 各保留并显示最近 N 条 |
@@ -700,9 +703,10 @@ python3 create_qr.py
 
 ### qr_display.py —— 外接屏幕显示扫码结果
 
-外接屏幕大字显示扫码结果的程序。`src.py` 启动时会自动拉起它，
-扫码后外接屏幕会自动切换为超大字体显示识别到的数字
+外接屏幕显示扫码结果的程序。`src.py` 启动时会自动拉起它，
+扫码后外接屏幕会自动切换为 12mm 字号显示识别到的数字
 （如 `156+123+516+231`）；也可以手动独立运行。
+等待扫码时外接屏为纯黑空白，不显示任何提示文字。
 
 ```bash
 # 自动选择外接屏（HDMI/DP/VGA 优先，多屏时其次选第 2 个屏）
@@ -712,6 +716,7 @@ python3 qr_display.py
 python3 qr_display.py --monitor 1
 python3 qr_display.py --file /tmp/qr_result.txt
 python3 qr_display.py --text 156+123
+python3 qr_display.py --font-mm 12
 
 # 已有旧显示实例占着单实例锁时，用 --replace 请它退出并接管
 python3 qr_display.py --replace
@@ -729,17 +734,17 @@ DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority python3 qr_display.py --moni
 
 ```yaml
 display:
-  qr_display:
-    enabled: true      # 是否由 src.py 自动启动显示端
-    display: ":0"      # 固定到物理外接屏所在会话（本机为 :0）
-    xauthority: "/run/user/1000/gdm/Xauthority"  # 物理会话的 X 授权文件
-    monitor: 0         # 0 = 物理会话中的第一个显示器；null=自动选外接屏
-    state_file: /tmp/qr_display_result.txt
-    log_file: /tmp/qr_display.log
+    qr_display:
+      enabled: true      # 是否由 src.py 自动启动显示端
+      display: ":0"      # 固定到物理外接屏所在会话（本机为 :0）
+      xauthority: "/run/user/1000/gdm/Xauthority"  # 物理会话 :0 的 X 授权文件
+      monitor: 0         # 0 = 物理会话中的第一个显示器；null=自动选外接屏
+      state_file: /run/user/1000/qr_display_result.txt
+      log_file: /run/user/1000/qr_display.log
     replace: true      # 启动时若有旧显示进程，先请其退出再接管
 ```
 
-每次运行 `src.py` 会先清空状态文件，外接屏显示“等待扫码...”，
+每次运行 `src.py` 会先清空状态文件，外接屏保持纯黑空白，
 扫到二维码后自动更新为识别结果。
 显示进程以独立会话启动并忽略 SIGHUP，输出写入 `log_file`；
 即使 `src.py` 被 Ctrl+C 停止、或运行它的终端被关闭，外接屏仍保留最后结果。
@@ -747,13 +752,13 @@ display:
 方便定位。可在显示窗口按 `Esc` / `Q` 关闭显示，或：
 
 ```bash
-kill $(cat /tmp/qr_display.lock)
+kill $(cat /run/user/1000/qr_display.lock)
 ```
 
-注意：`display` 留空（推荐）时窗口显示在运行 `src.py` 的那个会话里；
-本机已填 `:0` + 对应 `xauthority`，所以无论 `src.py` 在 XRDP 远程桌面（`:10`）
-还是物理桌面（`:0`）里启动，二维码窗口都固定显示在物理外接屏上；
-若 X 授权文件不对，显示进程会因无授权而启动即退出。
+注意：本机配置已固定 `display: ":0"` + `xauthority`，所以无论 `src.py`
+在 XRDP 远程桌面（`:10`）还是物理桌面（`:0`）里启动，二维码窗口都只会显示在
+物理外接屏（HDMI-2）上，不会出现在远程桌面里；若 X 授权文件不对，
+显示进程会因无授权而启动即退出。
 
 ---
 
